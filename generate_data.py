@@ -417,8 +417,11 @@ def apply_anomalies(readings, anomalies, n_home, rng):
         elif atype == "compressor_stuck_on":
             readings[cfg.POWER][s:e] = mag + rng.normal(0, cfg.FRIDGE["noise_sd_on"], e - s)
         elif atype == "intrusion_motion":
-            moves = (rng.random(e - s) < mag).astype(int)
-            moves[0] = 1  # the intruder is seen at least once at the start
+            # Exactly round(mag * duration) motion minutes, at least 2 (never looks like one stray trigger)
+            k = max(2, round(mag * (e - s)))
+            moves = np.zeros(e - s, dtype=int)
+            moves[0] = 1  # the intruder is seen at the start
+            moves[rng.choice(np.arange(1, e - s), size=k - 1, replace=False)] = 1
             readings[cfg.MOTION][s:e] = moves
         elif atype in ("door_open_night", "door_left_open"):
             open_door(readings[cfg.DOOR], readings[cfg.MOTION], s, e - s, rng, n_home)

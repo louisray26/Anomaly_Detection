@@ -107,7 +107,7 @@ The same reading can be an event or an anomaly depending on context (e.g. door o
   - So "house empty" only occurs on Tue–Thu daytime.
 - **Indoor temperature:**
   - Thermostat targets 21 °C while awake and home, 18 °C at night, and 18 °C eco mode while the house is empty (Tue–Thu daytime).
-  - Room temperature follows the target with a first-order lag: **45 min when heating, 300 min when cooling**. Normal night cooling is ~0.4 °C/h (measured), slower than any heating failure.
+  - Room temperature follows the target with a first-order lag: **45 min when heating, 300 min when cooling**. Normal setback cooling (23:00 night setback, Tue–Thu eco mode) starts at ~0.6 °C/h and slows to ~0.2 °C/h. It overlaps the slowest heating failures (0.5 °C/h), so a failure is only identifiable in context: falling while the target is 21 °C.
   - Afternoon solar gain of ~+0.5 °C, sensor noise ~0.1 °C.
 - **Fridge power:**
   - Compressor 100–130 W for 12–18 min, idle 2–5 W for 18–30 min (~40% duty).
@@ -130,7 +130,7 @@ Random start within the allowed window, with random duration and magnitude per a
 | `heating_failure` | 21 °C target throughout the failure **and** the 150-min recovery reserve | 1.5–3 h fall + recovery | Fall rate 0.5–1.0 °C/h, **total drop ≥ 1.5 °C**. Label covers the recovery too |
 | `fridge_power_loss` | Any time | 45–120 min | Power reads 0–0.5 W |
 | `compressor_stuck_on` | Any time | 1–2 h | Constant 100–130 W (normal run ≤ 18 min) |
-| `intrusion_motion` | Tue–Thu while the house is empty | 5–30 min | Share of minutes with motion 0.3–0.6, no door opening |
+| `intrusion_motion` | Tue–Thu while the house is empty | 5–30 min | Share of minutes with motion 0.3–0.6: exactly max(2, round(share × duration)) motion minutes, first minute always on, no door opening |
 | `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, with hallway motion around it |
 | `door_left_open` | Awake and home | 20–60 min | Minutes open (normal 1–3 min) |
 
@@ -198,7 +198,18 @@ Items to include in README.md when it is written at the end:
 - **Assumptions:** household profile (two adults, hybrid WFH Mon/Fri, house empty only Tue–Thu daytime, one adult always home at weekends), thermostat with night setback and eco mode, winter heating season, no daylight-saving change.
 - **Data quality:** outages and missing data are handled in cleaning, not scored as anomalies.
 - **Limitations:** with 2 anomalies per type in validation/test, per-type recall can only be 0%, 50% or 100%. Training contains unlabelled anomalies (contamination). Anomalous minutes are 7–10% per split, higher than a real home, mainly because heating-failure labels include the recovery.
-- **Synthetic data realism:** a reviewer pass fixed 6 issues plus 1 follow-up: idle noise, cooling lag, durations, arrival motion, stray motion, heating recovery labels, and door-motion only at the first and last minute. Mention this as part of the process.
+- **Synthetic data realism:** two reviewer passes fixed:
+  - fridge idle noise
+  - cooling lag
+  - durations
+  - motion before arrival
+  - stray motion when empty
+  - heating recovery labels
+  - door motion only at the first and last minute
+  - intrusions always have ≥2 motion minutes
+
+  Mention this as part of the process.
+- **Heating failure is contextual:** normal setback cooling (~0.6 °C/h at its start) overlaps the slowest failures. The rate of fall alone is not enough; the detector needs the context (target 21 °C, awake and home).
 - **Productionization:** on-device serving. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
 - **AI transcripts:** exported per phase into `ai_transcripts/`.
 - **Repo layout:** the tree and a one-line role for each file (Stage 2).
