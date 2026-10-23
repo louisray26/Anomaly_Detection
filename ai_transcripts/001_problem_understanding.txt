@@ -1,0 +1,667 @@
+ ▐▛███▛█   Claude Code v2.1.306
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   ~\Projects\Anomaly Detection\docs
+
+
+❯ /rename AD_Workflow 
+  ⎿  Session renamed to: AD_Workflow
+
+❯ I am giving you the plan.md that has my instructions to you and the task.md   
+  which contains the original task given to me. Dont start with the code yet    
+  and start with the first Phase Problem Understnding. If something is missing  
+  let me know. This is just a rough plan. One we discuss on each stage and      
+  ddecide lets update the design.md. Is there anything unclear in this setup.   
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I read docs/plan.md and docs/task.md. docs/design.md is empty, so I'll leave
+  it alone until we've agreed on this phase.
+
+  Part A: Gaps in the setup
+
+  Missing from the plan or repo structure
+
+  1. ai_transcripts/ directory. The task requires it and the plan doesn't list
+     it. Claude Code can export a session with /export. The transcripts must be
+     unedited, so export at the end of each session and don't clean them up.
+  2. README.md is in the last stage but not in the file list.
+  3. Shared preprocessing code. The plan puts cleaning decisions in
+     analysis.ipynb. But inference.py has to run the same cleaning and feature
+     steps, and it can't import from a notebook. I suggest one small shared
+     module (e.g. features.py). The notebook would explore and justify the
+     choices, and the module would hold the code.
+  4. Output locations. The task says the code should output the detected 
+     anomalies. I suggest data/ (raw CSV and labels), artifacts/ (saved model
+     and config), and outputs/ (alerts CSV and metrics).
+
+  Things that will affect design later, worth knowing now
+
+  5. Real-time means causal features only. No centered rolling windows and no
+     look-ahead smoothing. Validation and test also need a warm-up buffer
+     carried over from the previous split. Otherwise the first hours of day 15
+     and day 22 get broken features.
+  6. "Correct sensor" vs. Isolation Forest. A single multivariate Isolation
+     Forest gives one score per timestamp, not per sensor. To answer "detected
+     on the correct sensor?", we'll need either one model per sensor or a way to
+     attribute each alert to a sensor. This matters in the model stage, but it
+     also shapes how we label now.
+  7. Small splits. Validation and test are one week each, so each contains one
+     weekend. Training sees only 4 weekend days. With only about 2 events per
+     anomaly type per split, per-type metrics will be noisy. That's fine for a
+     proof of concept, but the README should say so.
+  8. Event-level vs. point-level metrics. Your evaluation questions (events
+     detected, latency, false alarms) are event-level. That's the right choice,
+     and the labels need to support it (see below).
+  9. Minor: you're on master, but the main branch is main.
+
+  Part B: Phase 1 – Problem understanding
+
+  The setting
+
+  - One household with mixed sensors: continuous (temperature, power) and binary
+    (motion, door).
+  - Unsupervised in practice. Real users never label anomalies. Our injected
+    labels exist only for evaluation.
+  - False alarms are the main cost. A DIY user who gets 5 bogus alerts a day
+    turns the system off. So precision and an explanation for each alert matter
+    as much as recall.
+  - Runs on modest hardware (Raspberry Pi or Home Assistant class), so the model
+    should be small and cheap.
+
+  Event vs. anomaly
+
+  - An event is a normal state change or activity: the door opens at 08:15,
+    there's hallway motion in the evening, the fridge compressor starts.
+  - An anomaly is an observation that is unlikely given its context (time of
+    day, day of week, other sensors, recent history).
+  - The same raw reading can be either. A door opening at 08:15 on a weekday is
+    an event. A door opening at 03:10 with no motion beforehand is an anomaly.
+    So detection has to be context-aware, and a plain value threshold won't work
+    for the binary sensors.
+  - Benign rare events sit in between: late-night bathroom trips, guests at the
+    weekend, the fridge defrost cycle. They are not anomalies, but a naive
+    detector will flag them. They are the true test of the false-alarm rate.
+
+  Sensors: normal behaviour and realistic anomalies
+
+  Sensor: Indoor temp (continuous, slow)
+  Normal behaviour: 19–23 °C. Daily cycle from the heating schedule (night
+  setback, morning warm-up), small afternoon solar gain, noise of about ±0.1 °C
+  Realistic anomalies: Heating failure (slow drift down over hours), rapid
+  unexplained rise, stuck/flatlined sensor, single-reading spike (glitch)
+  ────────────────────────────────────────
+  Sensor: Fridge power (continuous, cyclic)
+  Normal behaviour: Compressor runs at about 80–150 W, idles at about 1–5 W.
+  Duty
+  cycle 30–50%, cycles of 20–40 min. Defrost heater spike every 8–12 h. Short
+  bumps when the door is opened
+  Realistic anomalies: Drops to ~0 W (failure or unplugged), compressor never
+  stops (door ajar or refrigerant leak), short cycling, abnormally high draw
+  ────────────────────────────────────────
+  Sensor: Hallway motion (binary per minute)
+  Normal behaviour: Follows occupancy: morning and evening peaks, quiet while
+  away on weekdays, sparse at night
+  Realistic anomalies: Motion while the house should be empty and no door opened
+
+  first (intrusion), sensor stuck on
+  ────────────────────────────────────────
+  Sensor: Front door (binary per minute)
+  Normal behaviour: Mostly closed. Short openings (1–3 min) around leaving and
+  returning
+  Realistic anomalies: Opened at night, left open for a long time (>30 min),
+  opened with no motion before or after
+
+  Anomaly types worth showing a reviewer
+  - Point: a single spike.
+  - Contextual: normal value, wrong time.
+  - Collective: a pattern that is only abnormal because it lasts (stuck value,
+    compressor never stopping).
+  - Cross-sensor: door and motion disagree.
+
+  Proposed injection catalogue (8 types, kept deliberately small)
+
+  ┌─────┬─────────────────────┬─────────────┬───────────────────┬──────────┐
+  │  #  │        Type         │  Sensor(s)  │     Category      │ Duration │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 1   │ Temperature spike   │ temp        │ point / sensor    │ 1–3 min  │
+  │     │                     │             │ fault             │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 2   │ Heating failure     │ temp        │ collective        │ 3–8 h    │
+  │     │ drift               │             │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 3   │ Stuck sensor        │ temp        │ collective /      │ 2–6 h    │
+  │     │                     │             │ sensor fault      │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 4   │ Fridge power loss   │ fridge      │ collective        │ 1–6 h    │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 5   │ Compressor never    │ fridge      │ collective        │ 2–5 h    │
+  │     │ stops               │             │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 6   │ Motion while away,  │ motion      │ contextual /      │ 5–30 min │
+  │     │ no door entry       │             │ cross-sensor      │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 7   │ Door opened at      │ door        │ contextual        │ 1–10 min │
+  │     │ night               │ (+motion)   │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 8   │ Door left open      │ door        │ collective        │ 30–120   │
+  │     │                     │             │                   │ min      │
+  └─────┴─────────────────────┴─────────────┴───────────────────┴──────────┘
+
+  - Timing, magnitude and duration are randomised for each event, as your plan
+    asks.
+  - That's about 2 events per type per split, so roughly 16 per split.
+  - Labels: an event-level table (event_id, type, sensor(s), start, end, 
+    magnitude) plus per-minute labels, both stored apart from the measurements.
+
+  Part C: Questions before I write this into design.md
+
+  1. Training contamination. Should the training data contain unlabelled
+     anomalies (realistic, and it tests robustness), or be clean (simpler)? I 
+     recommend contaminated at a lower rate. Real training data is never clean,
+     and both robust rule thresholds and Isolation Forest are built to cope with
+     it.
+  2. Missing data and outages. Your "40,320 before missing observations or
+     outages" suggests you plan gaps. Should a sensor outage count as an anomaly
+     to detect and score, or as a data-quality issue handled in cleaning and
+     reported separately? I recommend the second: simulate a few gaps, have a
+     simple rule raise a "sensor offline" alert, and keep it out of the anomaly
+     metrics.
+  3. Benign rare events. Should we inject unlabelled hard negatives (night
+     bathroom trips, a weekend with guests, defrost cycles)? I recommend yes, 
+     1–2 kinds. Without them the false-alarm numbers will look better than they
+     would in reality.
+  4. Household profile and season. I'd assume one or two working adults: away on
+     weekdays roughly 08:30–17:30 with ±30 min jitter, mostly home at weekends.
+     I'd also assume winter heating season with no daylight-saving change in
+     the 28 days. Does that work, or do you want a different profile (e.g.
+     someone working from home, which makes the "away" rules much harder)?
+  5. Scope of the catalogue. Are 8 types the right size for a 2–10 hour budget?
+     My view: 8 is the upper end of reasonable. If time is tight, I'd drop #3
+     and #5 first.
+
+  Once you've answered, I'll write the Phase 1 decisions into docs/design.md and
+  we can move on to the repo structure.
+
+✻ Cooked for 1m 13s · done 11:45 AM
+
+※ recap: We're building a smart-home anomaly detection proof of concept and are in Phase 1, problem understanding, where I've proposed 8 anomaly types and flagged a few setup gaps. Next, answer my five questions so I can write the agreed decisions into design.md. (disable recaps in /config)
+
+❯ this is just too much in one response. Dont jump to later stages now; we will 
+  be getting to the project repo structure and design later. I have updated     
+  the working principles in plan.md. Re-read it and follow those from now on.   
+  Am talking about the overall flow in plan.md; if there is no big issues that  
+  needs to fixed then lets first start with Porblem Understanding step by step. 
+
+  Read 1 file (ctrl+o to expand)
+
+● I re-read plan.md and will follow the updated principles from here on.
+
+  Issues with the overall flow
+
+  Priority: High
+  Issue: ai_transcripts/ isn't anywhere in the flow
+  Why it matters: The task requires it, and the transcripts must be unedited. I
+  suggest exporting each session (/export) as you go, not at the end.
+  ────────────────────────────────────────
+  Priority: Medium
+  Issue: The task says the detection script must output the detected anomalies.
+  The plan only mentions evaluating and saving models in detect_anomalies.py.
+  Why it matters: It's a stated deliverable. A one-line addition to the plan
+  covers it.
+
+  Neither changes the order of the stages, so we can go ahead.
+
+  Problem Understanding, Step 1: real-time anomaly detection for a DIY smart 
+  home
+
+  What makes this setting different from generic anomaly detection:
+
+  1. No real labels. A homeowner never labels anomalies, so the detector has to
+     be unsupervised or rule-based. The labels we inject are only for measuring
+     how well it works.
+  2. Real-time means causal. Each decision can only use past and current
+     readings. This rules out centered smoothing and any look-ahead.
+  3. False alarms cost a lot. A DIY user who gets several bogus alerts a day
+     turns the system off. Precision matters as much as recall.
+  4. Alerts must be explainable. "Fridge drew 0 W for 90 min" is something a
+     user can act on. "Anomaly score 0.71" is not.
+  5. Cheap hardware. It probably runs on a Raspberry Pi or Home Assistant box,
+     so a small model is better.
+  6. Context sets normal. The same reading can be fine or alarming depending on
+     time of day, day of week, or other sensors. That's the core of the
+     event-vs-anomaly question in Step 2.
+
+  Questions:
+  1. Do you agree that false alarms should count as the main cost, more than
+     missed events, when we define success later?
+  2. Should we assume detection runs on the device in the home, or is a cloud
+     service also acceptable? This only affects how much complexity we can
+     justify.
+
+  Once you confirm, I'll move to Step 2: event vs. anomaly.
+
+✻ Worked for 15s · done 11:59 AM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, working through Problem Understanding step by step. Next, answer the two Step 1 questions (are false alarms the main cost, and does detection run on-device or in the cloud) so we can move to event vs. anomaly. (disable recaps in /config)
+
+❯ I have added the ai_transcripts udner the plan. Remind me to export as we     
+  complete each phase before we move on to next phase. Detection Part can be    
+  handles later when planning the repo stage. Moving to Stage 1, 1. for a       
+  success, flase alarms are just as costly as missed events. So lets decide on  
+  this when we are in the evaluation stage. 2. Lets keep it on device for now   
+  and focus on the cloud in the productionize part of  readme where we can it   
+  use retraining and updates.                                                   
+
+  Wrote 3 memories (ctrl+o to expand)
+
+● I'll remind you to export at the end of each phase. Noted for Step 1:
+  - Cost: false alarms and missed events count equally. We'll pin down how to
+    measure that in the evaluation stage.
+  - Deployment: detection runs on the device in the home. Cloud retraining and
+    updates go in the README's productionize section.
+
+  I'll add these to design.md when Stage 1 is complete.
+
+  Step 2: event vs. anomaly
+
+  - Event: a normal, expected thing happening, such as the door opening, motion,
+    or the fridge compressor starting. Most sensor activity is events.
+  - Anomaly: an observation that is unlikely given its context: time of day, day
+    of week, recent history, or other sensors.
+
+  The same reading can be either:
+
+  ┌─────────────────┬──────────────────────────┬───────────────────────────┐
+  │     Reading     │       Event when…        │       Anomaly when…       │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Front door      │ 08:15 on a weekday,      │ 03:10 with no motion      │
+  │ opens           │ leaving for work         │ before it                 │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Hallway motion  │ 19:00, people are home   │ 14:00 on a weekday, house │
+  │                 │                          │  empty, no door entry     │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │                 │ Off phase between        │                           │
+  │ Fridge at 0 W   │ compressor cycles (~20   │ Stays at 0 W for 3 hours  │
+  │                 │ min)                     │                           │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Temperature     │ Heating night setback at │ Keeps falling for hours   │
+  │ drops 1 °C      │  23:00                   │ while heating should be   │
+  │                 │                          │ on                        │
+  └─────────────────┴──────────────────────────┴───────────────────────────┘
+
+  So an anomaly isn't defined by its value alone. It depends on context (when it
+  happens), duration (how long it lasts) and consistency (whether other sensors
+  agree).
+
+  Benign rare events are a third group: unusual but not anomalous. Examples are
+  a late-night bathroom trip, guests at the weekend, or the fridge defrost
+  cycle. They aren't labelled as anomalies, but they are what most often
+  triggers false alarms.
+
+  Question: Should benign rare events be part of the dataset as unlabelled
+  distractors? I recommend yes, 1–2 kinds. You weighted false alarms equal to
+  missed events, and without distractors the false-alarm rate would look better
+  than it really is.
+
+✻ Sautéed for 20s · done 12:21 PM
+
+※ recap: We're building an anomaly-detection proof of concept for a smart home and are on Stage 1, Step 2: telling normal events apart from anomalies. Next, you decide whether to add 1–2 kinds of unlabelled benign rare events as distractors. (disable recaps in /config)
+
+❯ we can one or two kinds in that dataset to make it look more realistic..lets  
+  move to the next step                                                         
+
+● Noted: the dataset will include 1–2 kinds of benign rare events as unlabelled
+  distractors. We'll pick which ones in Step 4.
+
+  Step 3: sensor types and how they behave normally
+
+  Sensor: Indoor temperature
+  Data type: Continuous, slow-moving
+  Normal behaviour (real-world example): 19–23 °C. Heating schedule drives the
+  daily cycle: warm-up around 06:30, night setback around 23:00. Small rise
+  from afternoon sun. Noise of about ±0.1 °C.
+  ────────────────────────────────────────
+  Sensor: Fridge power
+  Data type: Continuous, cyclic
+  Normal behaviour (real-world example): Compressor runs at about 80–150 W for
+  10–20 min, then idles at about 1–5 W. Duty cycle 30–50%. Defrost heater spike
+   every 8–12 h. Short bumps after the fridge door is opened.
+  ────────────────────────────────────────
+  Sensor: Hallway motion
+  Data type: Binary (0/1 per minute)
+  Normal behaviour (real-world example): Follows occupancy: morning and evening
+  peaks, quiet while away on weekdays, sparse at night.
+  ────────────────────────────────────────
+  Sensor: Front door
+  Data type: Binary (0 = closed, 1 = open)
+  Normal behaviour (real-world example): Closed almost all the time. Opens for
+  1–3 min when people leave or return.
+
+  Why this matters
+  - Continuous sensors can be judged on their value and rate of change.
+  - Binary sensors can only be judged by when and how long they're active, and
+    whether that matches the other sensors.
+  - So one detection approach probably won't suit all four sensors. I'll note
+    that now and come back to it in the model stage.
+
+  Questions:
+  1. Household profile. I suggest one or two working adults: away on weekdays
+     around 08:30–17:30 with some daily variation, mostly home at weekends.
+     Working from home would make "house empty" anomalies much harder to define.
+     Does the first profile work for you?
+  2. Season. I suggest winter heating season with no daylight-saving change in
+     the 28 days. Heating gives temperature a clear daily cycle, and avoiding
+     the clock change avoids timestamp complications. Agree?
+
+✻ Brewed for 8s · done 2:25 PM
+
+❯ Household profile: We will go with two adults with one having aa hybrid       
+  option of 3 days at aoofice and 2 days at house. 2. Suggeested should be      
+  fine.                                                                         
+
+● Noted: winter heating season, no daylight-saving change.
+
+  A risk with the hybrid profile (medium priority): on the 2 work-from-home days
+  someone is home all day, so daytime hallway motion is normal on those days.
+  That makes "motion while the house is empty" valid on only 3 weekdays. Whether
+  a detector can learn this depends on how the work-from-home days are chosen:
+
+  ┌───────────────┬─────────────────────────────────────────────────────────┐
+  │    Option     │                         Effect                          │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ Fixed days    │ Shows up as a weekly pattern. But training covers only  │
+  │ (e.g. Mon and │ 2 weeks, so each weekday appears just twice, which is   │
+  │  Fri at home) │ weak but learnable.                                     │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │               │ Realistic, but no detector can tell whether the house   │
+  │ Random days   │ is meant to be empty. Daytime-intrusion anomalies would │
+  │ each week     │  turn into guesswork, and we'd get either false alarms  │
+  │               │ or missed events.                                       │
+  └───────────────┴─────────────────────────────────────────────────────────┘
+
+  My recommendation is fixed days, Mon and Fri at home. It keeps the profile
+  realistic and the intrusion anomaly well defined.
+
+  Question: Fixed Mon/Fri work-from-home days, or do you want random days and
+  accept that daytime intrusion will be hard to detect?
+
+  Once that's settled, Step 4 (choosing which events and anomalies to inject) is
+  the last step of Problem Understanding.
+
+✻ Worked for 9s · done 2:33 PM
+
+❯ lets keep it fixedd mon/fri for this task..                                   
+
+● Fixed: work from home on Mon and Fri; office on Tue, Wed and Thu.
+
+  Step 4: what to inject
+
+  Proposed anomalies (7 types, at least one per sensor, covering every anomaly
+  category):
+
+  ┌─────┬─────────────────────┬──────────┬────────────────┬────────────────┐
+  │  #  │       Anomaly       │  Sensor  │    Category    │  Real-world    │
+  │     │                     │          │                │    meaning     │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 1   │ Temperature spike   │ temp     │ point          │ Sensor glitch  │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Heating failure     │          │                │                │
+  │ 2   │ (slow drift down    │ temp     │ collective     │ Boiler fault   │
+  │     │ over hours)         │          │                │                │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 3   │ Power drops to ~0 W │ fridge   │ collective     │ Fridge failure │
+  │     │  for hours          │          │                │  or unplugged  │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Compressor never    │          │                │ Door ajar or   │
+  │ 4   │ stops               │ fridge   │ collective     │ refrigerant    │
+  │     │                     │          │                │ leak           │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Daytime motion on   │ motion   │ contextual /   │                │
+  │ 5   │ an office day, no   │ (+door)  │ cross-sensor   │ Intrusion      │
+  │     │ door entry first    │          │                │                │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 6   │ Door opened at      │ door     │ contextual     │ Security       │
+  │     │ night               │          │                │ breach         │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 7   │ Door left open for  │ door     │ collective     │ Forgot to      │
+  │     │ a long time         │          │                │ close it       │
+  └─────┴─────────────────────┴──────────┴────────────────┴────────────────┘
+
+  Timing, magnitude and duration will be randomised per event. We'll settle the
+  exact ranges and counts in the dataset stage.
+
+  Proposed benign rare events (unlabelled distractors):
+  - Night bathroom trip: a brief hallway motion at around 02:00–04:00, with no
+    door activity.
+  - Weekend guests: extra door openings and motion late on a Saturday evening.
+
+  Questions:
+  1. Is this list right, or would you add or drop anything? Seven is a
+     reasonable size for the time budget. If we need to trim, #4 is the first to
+     drop.
+  2. Missing data and outages. Your scope mentions missing observations. Should
+     a sensor going offline be a data-quality issue (handled in cleaning and
+     reported separately) or an anomaly we detect and score? I recommend
+     treating it as a data-quality issue so it doesn't skew the anomaly metrics.
+
+✻ Churned for 11s · done 2:45 PM
+
+※ recap: We're finishing Stage 1 (Problem Understanding) of your smart-home anomaly detection take-home by settling which events and anomalies to inject. Next, approve the 7-anomaly list and decide whether sensor outages count as anomalies or data-quality issues.
+
+❯ lets go with 7...1.Let add 1-2 anomalies per type in validationa and test     
+  set. Training gete atleast teo per type, unlabelled for the models. 2.Its an  
+  data qulaity issue, handles while cleaning.                                   
+
+● Write(design.md)
+  ⎿  Wrote 57 lines to design.md
+       1 # Design Decisions
+       3 ## Stage 1 – Problem Understanding
+       4 
+       6 - Real-time anomaly detection for a single DIY smart home, runni
+       7 - Cloud retraining and model updates are covered only in the REA
+         DME's productionization section.
+         rule-based. Injected labels are used only for evaluation.
+       9 - Real-time means **causal**: each decision uses only past and c
+      10 - False alarms and missed events are treated as **equally costly
+         tage.
+     … +78 lines (ctrl+o to expand)
+
+● I've written the Stage 1 decisions into docs/design.md.
+
+  One risk to flag (medium priority): with only 1 event of a type in a split,
+  detection rate for that type can only be 0% or 100%. We can fix exact counts
+  in the dataset stage. I'd lean towards 2 per type in validation and test,
+  which is 14 events each.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Once you've reviewed design.md and approved Stage 1, we'll move on to the repo
+  structure.
+
+✻ Sautéed for 22s · done 3:03 PM
+
+❯ then 2 per type then in val/test so the recal per type isnt 0 or 100...lets   
+  add atleast 3 per type in training dataset...lets keep the anomaly rate       
+  small. We will have to check % of anomaly minutes after data generation.If    
+  its high we might have to shorten their durations.                            
+
+● Update(design.md)
+  ⎿  Added 3 lines, removed 2 lines
+      45  
+      46  - Timing, magnitude and duration are randomised per event. Exac
+          t ranges are set in the dataset stage.
+      47  - **Counts:**
+      48 -  - Train: at least 2 per type. Present in the data, but labels
+         - are never used as model input (realistic contamination).      
+      49 -  - Validation and test: 1–2 per type.                         
+      48 +  - Train: at least 3 per type (≥21 events). Present in the dat
+         +a, but labels are never used as model input (realistic contamin
+         +ation).                                                        
+      49 +  - Validation and test: exactly 2 per type (14 events each), s
+         +o per-type recall is not limited to 0% or 100%.                
+      50 +- **Keep the anomaly rate small.** Check the % of anomalous min
+         +utes (overall and per sensor) after generation. If it is too hi
+         +gh, shorten the long-duration anomalies.                       
+      51  
+      52  ### Benign rare events (unlabelled distractors)
+      53  - **Night bathroom trip:** brief hallway motion around 02:00–04
+          :00, no door activity.
+
+● I've updated design.md: training gets at least 3 per type, validation and test
+  get exactly 2 per type, and we check the % of anomalous minutes after
+  generation.
+
+  Two things to know:
+  - Low priority: with 2 events per type, per-type recall can still only be 0%,
+    50% or 100%. That's fine for a proof of concept, but we should say so in the
+    README.
+  - Medium priority: you're right to check the anomaly rate. A rough estimate
+    using durations at the middle of the ranges discussed so far (not real data
+    yet): in training, the long anomalies (heating failure, fridge power loss,
+    compressor never stops) could make up around 5–6% of the temperature and 
+    fridge minutes. That's probably the upper end of "small". We'll measure it
+    properly after generation and shorten durations if needed.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Is Stage 1 approved?
+
+✻ Cooked for 10s · done 3:31 PM
+❯ Some udpates 1.note down all the things that have to be added in readme  in   
+  the design documnet as a last section so we can carry over later... 2. Make   
+  events and anomlaies term seperate in the deign doc.                          
+
+● Update(design.md)
+  ⎿  Added 9 lines, removed 5 lines
+      10  - False alarms and missed events are treated as **equally costl
+          y**. The exact success metric will be defined in the evaluation
+           stage.
+      11  - Alerts must be explainable to a non-expert user.
+      12  
+      13 -### Event vs. anomaly                                          
+      14 -- **Event:** a normal, expected occurrence (door opens, motion,
+         - compressor cycle).                                            
+      15 -- **Anomaly:** an observation that is unlikely given its contex
+         -t: time of day, day of week, duration, or consistency with othe
+         -r sensors.                                                     
+      16 -- The same reading can be either (e.g. door opening at 08:15 vs
+         -. 03:10). Value thresholds alone are not enough.               
+      17 -- **Benign rare events:** unusual but normal. They stay unlabel
+         -led and test the false-alarm rate.                             
+      13 +### Terminology                                                
+      14 +This document keeps the two terms strictly separate:           
+      15  
+      16 +- **Event:** normal activity. It is never labelled and never co
+         +unted as a detection target.                                   
+      17 +  - **Routine events:** everyday activity (door opens when leav
+         +ing, evening motion, compressor cycle, defrost).               
+      18 +  - **Benign rare events:** unusual but normal activity (night 
+         +bathroom trip, weekend guests). They test the false-alarm rate.
+      19 +- **Anomaly:** an observation that is unlikely given its contex
+         +t (time of day, day of week, duration, or consistency with othe
+         +r sensors). Anomalies are injected, labelled, and are the detec
+         +tion targets.                                                  
+      20 +                                                               
+      21 +The same reading can be an event or an anomaly depending on con
+         +text (e.g. door opening at 08:15 vs. 03:10), so value threshold
+         +s alone are not enough.                                        
+      22 +                                                               
+      23  ### Sensors
+      24  
+      25  | Sensor | Data type | Normal behaviour |
+
+● Update(design.md)
+  ⎿  Added 2 lines, removed 2 lines
+      49  
+      50  - Timing, magnitude and duration are randomised per event. Exac
+          t ranges are set in the dataset stage.
+      51  - **Counts:**
+      52 -  - Train: at least 3 per type (≥21 events). Present in the dat
+         -a, but labels are never used as model input (realistic contamin
+         -ation).                                                        
+      53 -  - Validation and test: exactly 2 per type (14 events each), s
+         -o per-type recall is not limited to 0% or 100%.                
+      52 +  - Train: at least 3 per type (≥21 anomalies). Present in the 
+         +data, but labels are never used as model input (realistic conta
+         +mination).                                                     
+      53 +  - Validation and test: exactly 2 per type (14 anomalies each)
+         +, so per-type recall is not limited to 0% or 100%.             
+      54  - **Keep the anomaly rate small.** Check the % of anomalous min
+          utes (overall and per sensor) after generation. If it is too hi
+          gh, shorten the long-duration anomalies.
+      55  
+      56  ### Benign rare events (unlabelled distractors)
+
+● Update(design.md)
+  ⎿  Added 16 lines, removed 2 lines
+      53    - Validation and test: exactly 2 per type (14 anomalies each)
+          , so per-type recall is not limited to 0% or 100%.
+      54  - **Keep the anomaly rate small.** Check the % of anomalous min
+          utes (overall and per sensor) after generation. If it is too hi
+          gh, shorten the long-duration anomalies.
+      55  
+      56 -### Benign rare events (unlabelled distractors)                
+      56 +### Injected benign rare events (unlabelled distractors)       
+      57  - **Night bathroom trip:** brief hallway motion around 02:00–04
+          :00, no door activity.
+      58  - **Weekend guests:** extra door openings and motion on a Satur
+          day evening.
+      59  
+      60  ### Data quality
+      61 -- Sensor outages and missing observations are a **data-quality 
+         -issue**, not an anomaly.                                       
+      61 +- Sensor outages and missing observations are a **data-quality 
+         +issue**, neither an event nor an anomaly.                      
+      62  - They are handled during cleaning and reported separately, and
+           excluded from anomaly metrics.
+      63 +                                                               
+      64 +---                                                            
+      65 +                                                               
+      66 +## README Carry-Over                                           
+      67 +Items to include in README.md when it is written at the end:   
+      68 +                                                               
+      69 +- **Overview:** on-device, causal, real-time detection for one 
+         +household. Labels are used only for evaluation.                
+      70 +- **Terminology:** events (routine + benign rare) vs. anomalies
+         +.                                                              
+      71 +- **Anomaly definitions:** the 7 injected anomaly types with th
+         +eir real-world meaning.                                        
+      72 +- **Assumptions:** household profile (two adults, hybrid WFH Mo
+         +n/Fri, house empty Tue–Thu daytime), winter heating season, no 
+         +daylight-saving change.                                        
+      73 +- **Data quality:** outages and missing data are handled in cle
+         +aning, not scored as anomalies.                                
+      74 +- **Limitations:** with 2 anomalies per type in validation/test
+         +, per-type recall can only be 0%, 50% or 100%. Training contain
+         +s unlabelled anomalies (contamination).                        
+      75 +- **Productionization:** on-device serving. Cloud is used for r
+         +etraining and model updates. Monitoring and retraining strategy
+         + still to be written.                                          
+      76 +- **AI transcripts:** exported per phase into `ai_transcripts/`
+         +.                                                              
+
+  Ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● I've updated docs/design.md with both changes:
+
+  1. Event and anomaly are now separate terms. A new Terminology section defines
+     them:
+     - Event: normal activity, never labelled. It has two subtypes: routine
+       events and benign rare events.
+     - Anomaly: an injected, labelled detection target.
+
+     I also fixed places where the doc called anomalies "events" (it now says
+     "14 anomalies" per split, not "14 events").
+  2. New last section, "README Carry-Over". It lists what we've decided so far
+     that belongs in the README: overview, terminology, anomaly definitions,
+     assumptions, data quality, limitations, productionization notes and the AI
+     transcripts. I'll add to it at the end of each stage.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Is Stage 1 approved?
+
+✻ Crunched for 28s · done 3:42 PM

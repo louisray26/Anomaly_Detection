@@ -20,7 +20,11 @@ These are the working defaults. Confirm important assumptions before coding and 
 
 - Work through one stage at a time. Propose the design, explain important trade-offs, and ask 3–5 focused questions when clarification is needed. Wait for my approval before implementing that stage.
 
+- Do not raise topics that belong to later stages (repo structure, models, evaluation) until we reach them. Keep each reply short.
+
 - Keep explanations concise and practical. Support recommendations with technical reasoning, evidence, or examples. Do not agree with me automatically; point out incorrect assumptions and material risks.
+
+- Point out issues that are critcal or go against the task instrutions. Also when you provide the issues; put a prority on them.
 
 - Base conclusions on actual data, experiments, and tests. Never fabricate results, metrics, execution logs, or test outcomes.
 
@@ -47,6 +51,8 @@ These are the working defaults. Confirm important assumptions before coding and 
     detect_anomalies.py #Evaluation of all models and savimg the model happen here
     inference.py #Inferne with the best model - Production
     requirements.txt 
+    ai_transcripts/
+    docs/
 
 - Dataset Design, Creation and Split
     Have identifers for the sensors, anomalies and others is needed
