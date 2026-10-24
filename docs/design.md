@@ -73,16 +73,16 @@ The same reading can be an event or an anomaly depending on context (e.g. door o
 ├── features.py           # shared cleaning + causal features
 ├── analysis.ipynb        # cleaning decisions, EDA plots
 ├── detect_anomalies.py   # train/compare models on train+val, save best, write alerts
-├── inference.py          # stream test days line by line with saved model
+├── evaluate_test.py      # score frozen models on test, once (replaces inference.py; Stage 7 skipped)
 ├── data/                 # sensor readings CSV and labels CSV (separate files)
-├── artifacts/            # saved model, thresholds, preprocessing config
+├── artifacts/            # saved models, thresholds, preprocessing config (git-ignored, rebuilt)
 ├── outputs/              # alerts CSVs, metrics
 ├── docs/                 # plan, task, design
 └── ai_transcripts/       # exported AI session transcripts, one per phase
 ```
 
 ### Decisions
-- **`features.py`:** single source of cleaning and feature logic, shared by `detect_anomalies.py` and `inference.py`, so training and production cannot drift apart. `analysis.ipynb` justifies the choices but does not hold production code.
+- **`features.py`:** single source of cleaning and feature logic, shared by `detect_anomalies.py` and `evaluate_test.py` (and any future production stream), so training and production cannot drift apart. `analysis.ipynb` justifies the choices but does not hold production code.
 - **`config.py`:** single place for sensors, split dates, random seed and paths.
 - **`detect_anomalies.py`:** writes an alerts CSV (timestamp, sensor, score/rule, reason), as the task requires, in addition to comparing and saving models.
 - **Generated data is committed to git.** Sensor readings and labels are kept in separate files. The generator is fully reproducible from the seed in `config.py`.
@@ -425,7 +425,7 @@ Only the schedule changes: away Tue–Thu 08:00–18:30, night 23:30–06:00 (`c
 ### Files produced by `detect_anomalies.py` (and why)
 One run writes everything below; all are reproducible from the seed. Test is never loaded, so every file here is train-fit / val-scored only.
 
-**`artifacts/`** – fitted models (each candidate frozen as tuned on val, plus `selected_model.joblib` / `.json` for `inference.py`). Git-ignored: not a required deliverable and rebuilt by running `detect_anomalies.py` (~40 s).
+**`artifacts/`** – fitted models (each candidate frozen as tuned on val, plus `selected_model.joblib` / `.json` for deployment). Git-ignored: not a required deliverable and rebuilt by running `detect_anomalies.py` (~40 s).
 
 **`outputs/` – val evidence for the comparison (what the design doc and README cite)**
 
@@ -447,6 +447,51 @@ One run writes everything below; all are reproducible from the seed. Test is nev
 - **Reviewer fixes:** (1) circularity caveat written down + schedule sensitivity run; (2) delay now reported per anomaly type. My first chart summary wrongly said heating-failure delay was "about the same as rules"; per-type delays show charts ~27 min vs rules ~59 min.
 - **Chart signal correction (design, not val tuning):** first version also charted `temp_resid`; 9 of its 10 temp FAs were heat-up ramps (06:30–07:10, 17:25–18:15), where readings sit above their lagging 15-min median for many minutes and the chart accumulates them. A chart measures sustained shifts; a 1–3 min spike is a single-minute rule's job, so `temp_resid` was removed and temp charts `temp_dev` (lower side) only. Effect: temp 4/4 hits 10 FA → 2/4 hits (spikes not targeted) 1 FA; charts overall 14 → 7 errors.
 - **Not iterated further (by decision):** IF v2 is the single fair revision; chart constants (λ, k, floors) and grids were not changed after seeing val.
+
+---
+
+## Stage 6 – Test Evaluation (run once)
+
+### Protocol
+- `evaluate_test.py` loads the four frozen candidates from `artifacts/` (as tuned on val). Nothing is fit or tuned; baseline, activity rates and chart stats come from train via the artifacts.
+- Test features: same `features.py` pipeline, 180-min warm-up from the end of val. Test labels are used for scoring only.
+- Same scoring rules as val. Rules with the wide schedule are scored too (val-tuned params; reported only).
+- **No changes after test:** results are reported as they are; fixes go to the README only.
+- **Frozen state is tagged:** git tag `frozen-before-test` on commit `3b32d9e` = models, features, config and val tuning as they were before test was loaded. `detect_anomalies.py`, `features.py` and `config.py` are unchanged since that tag (`git diff frozen-before-test -- detect_anomalies.py features.py config.py` is empty), so reviewers can verify nothing was changed after seeing test.
+- Outputs: `outputs/alerts_<model>_test.csv`, `test_comparison.csv`, `test_per_sensor.csv`, `test_per_type.csv`, `test_sensitivity.csv`.
+
+### Results (seed 42)
+
+| Model | Val errors | Test detected | Test FA | Benign FA | Cross-sensor FA | **Test errors** | Size | ms / minute |
+|---|---|---|---|---|---|---|---|---|
+| Rules | 0 | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0005 |
+| Control charts | 7 | 12/14 | 3 | 0 | 0 | 5 | 14 KB | 0.006 |
+| IF v2 | 9 | 8/14 | 4 | 1 | 1 | 10 | 20.9 MB | 0.027 |
+| IF v1 | 13 | 2/14 | 4 | 1 | 0 | 16 | 11.5 MB | 0.023 |
+
+Val ranking holds on test (rules < charts < IF v2 < IF v1).
+
+**Test detected | median delay (min) per anomaly type**
+
+| Anomaly type | Rules | Charts | IF v2 | IF v1 |
+|---|---|---|---|---|
+| temp_spike | 2/2 · 0 | 1/2 · 0 | 2/2 · 0 | 1/2 · 0 |
+| heating_failure | 2/2 · 54.5 | 2/2 · **19** | 1/2 · 115 | 1/2 · 134 |
+| fridge_power_loss | 2/2 · 9 | 2/2 · **3.5** | 0/2 | 0/2 |
+| compressor_stuck_on | 2/2 · 25.5 | 2/2 · **18.5** | 2/2 · 71.5 | 0/2 |
+| intrusion_motion | 2/2 · **2.5** | 1/2 · 17 | 1/2 · 20 | 0/2 |
+| door_open_night | 2/2 · **0** | 2/2 · 3 | 0/2 | 0/2 |
+| door_left_open | 2/2 · 10 | 2/2 · 5.5 | 2/2 · **5** | 0/2 |
+
+- **Rules:** 0 errors again; wide schedule adds 1 motion FA (1 error). Same circularity caveat: rule recall is an upper bound.
+- **Charts:** the 3 FAs are all `temp_dev` low (Tue 01‑30 08:47 and 11:57, Sat 02‑03 23:53). The one spike caught is the negative one (−5.5 °C), which drops `temp_dev` sharply; the positive spike is not a chart target. Night door openings were 2/2 on test (0/2 on val): with 2 per split, this is small-sample variation.
+- **IF v2:** door FAs at weekend 09:00 and a weekend-guests motion FA; misses both power losses on test (caught on val).
+- **IF v1:** worst on test (2/14), consistent with val.
+- Small samples (2 per type): per-type differences of one anomaly are within noise; the overall ranking is the robust result.
+
+## Stage 7 – Production Test (skipped)
+- Decision: skipped. The task asks only for a production discussion, so streaming is covered in the README text, not code.
+- Not done: `inference.py` streaming test minute by minute and checking its alerts match the batch run. The pipeline is causal by design (Stage 4), which is what makes the batch test result representative of streaming; the README states this was not verified with a streaming run.
 
 ---
 
@@ -489,7 +534,8 @@ Items to include in README.md when it is written at the end:
 - **Process notes for Stage 5:** CUSUM restart bug found and fixed before reporting; reviewer caught a misreported delay (per-sensor median hid per-type differences), so delays are now reported per type.
 - **Possible extension:** a hybrid (charts for fridge/heating drift, rules for context-dependent door/motion) — not built.
 - **Heating failure is contextual:** normal setback cooling (~0.6 °C/h at its start) overlaps the slowest failures. The rate of fall alone is not enough; the detector needs the context (target 21 °C, awake and home).
-- **Productionization:** on-device serving. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
+- **Productionization (text only, Stage 7 skipped):** on-device serving; describe minute-by-minute streaming with the same causal `features.py` and the frozen artifact, and note that a streaming-equals-batch check was not run. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
 - **AI transcripts:** exported per phase into `ai_transcripts/`.
 - **Repo layout:** the tree and a one-line role for each file (Stage 2).
-- **Setup & run:** `pip install -r requirements.txt`, then the run order `generate_data.py` → `analysis.ipynb` → `detect_anomalies.py` → `inference.py`. Note that the committed data is reproducible from the seed in `config.py`.
+- **Test results (Stage 6):** show the val-vs-test table and the per-type table; val ranking held on test (rules 0, charts 5, IF v2 10, IF v1 16 errors). Repeat the circularity caveat next to the rules' 0.
+- **Setup & run:** `pip install -r requirements.txt`, then the run order `generate_data.py` → `analysis.ipynb` → `detect_anomalies.py` → `evaluate_test.py`. Note that the committed data is reproducible from the seed in `config.py`.

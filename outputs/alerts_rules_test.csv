@@ -1,0 +1,15 @@
+sensor,model,start,end,reason
+door_front,rules,2024-01-29 03:48:00,2024-01-29 03:52:00,door open in night hours (night opening)
+power_fridge,rules,2024-01-29 09:24:00,2024-01-29 10:07:00,fridge < 1.0 W for 10 min (power loss)
+temp_living_room,rules,2024-01-29 14:46:00,2024-01-29 16:38:00,temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (heating failure)
+door_front,rules,2024-01-30 07:23:00,2024-01-30 07:46:00,door open > 10 min (left open)
+motion_hallway,rules,2024-01-30 15:27:00,2024-01-30 15:45:00,"motion in away hours, no door opening for 60 min (intrusion)"
+temp_living_room,rules,2024-01-31 18:07:00,2024-01-31 18:08:00,temp jumped > 1.5 degC from recent readings (spike)
+power_fridge,rules,2024-01-31 23:51:00,2024-02-01 00:39:00,fridge < 1.0 W for 10 min (power loss)
+motion_hallway,rules,2024-02-01 10:39:00,2024-02-01 10:47:00,"motion in away hours, no door opening for 60 min (intrusion)"
+power_fridge,rules,2024-02-02 00:41:00,2024-02-02 01:28:00,compressor running > 30 min (stuck on)
+temp_living_room,rules,2024-02-02 10:39:00,2024-02-02 12:29:00,temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (heating failure)
+door_front,rules,2024-02-02 20:51:00,2024-02-02 21:36:00,door open > 10 min (left open)
+door_front,rules,2024-02-03 03:43:00,2024-02-03 03:47:00,door open in night hours (night opening)
+temp_living_room,rules,2024-02-04 02:57:00,2024-02-04 02:59:00,temp jumped > 1.5 degC from recent readings (spike)
+power_fridge,rules,2024-02-04 09:04:00,2024-02-04 09:51:00,compressor running > 30 min (stuck on)

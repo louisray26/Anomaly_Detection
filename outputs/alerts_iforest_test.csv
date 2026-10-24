@@ -1,0 +1,7 @@
+sensor,model,start,end,reason
+temp_living_room,iforest,2024-01-29 06:59:00,2024-01-29 06:59:00,"temp_resid = 0.40, above 99.5% of train"
+temp_living_room,iforest,2024-01-31 18:07:00,2024-01-31 18:08:00,"temp_dev = 5.99, above 100.0% of train"
+temp_living_room,iforest,2024-02-02 12:00:00,2024-02-02 13:03:00,"temp_rate_60 = -0.89, below 100.0% of train"
+temp_living_room,iforest,2024-02-03 06:58:00,2024-02-03 06:58:00,"temp_dev = 1.15, above 99.8% of train"
+motion_hallway,iforest,2024-02-03 22:23:00,2024-02-03 22:34:00,"motion_15 = 11.00, above 99.8% of train"
+temp_living_room,iforest,2024-02-04 06:42:00,2024-02-04 06:42:00,"temp_dev = 1.08, above 99.7% of train"

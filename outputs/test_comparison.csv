@@ -1,0 +1,5 @@
+model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,benign_fa,total_errors,median_delay_min (median over sensors),model_size_kb,ms_per_minute,tuned_params
+rules,14/14,0,0,0.0,0,0,0,10.0,3.2,0.0005,3
+charts,12/14,2,3,0.43,0,0,5,13.0,14.0,0.0064,8
+iforest_v2,8/14,6,4,0.57,1,1,10,12.5,20863.7,0.0271,4
+iforest,2/14,12,4,0.57,0,1,16,67.0,11482.3,0.0228,4

@@ -1,0 +1,9 @@
+model,sensor,anomalies,hits,misses,false_alarms,cross_sensor_fa,benign_fa,errors,median_delay_min
+rules (main schedule),temp_living_room,4,4,0,0,0,0,0,26.5
+rules (main schedule),power_fridge,4,4,0,0,0,0,0,15.0
+rules (main schedule),motion_hallway,2,2,0,0,0,0,0,2.5
+rules (main schedule),door_front,4,4,0,0,0,0,0,5.0
+rules (wide schedule),temp_living_room,4,4,0,0,0,0,0,26.5
+rules (wide schedule),power_fridge,4,4,0,0,0,0,0,15.0
+rules (wide schedule),motion_hallway,2,2,0,1,0,0,1,2.5
+rules (wide schedule),door_front,4,4,0,0,0,0,0,5.0
