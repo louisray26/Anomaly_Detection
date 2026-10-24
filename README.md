@@ -106,7 +106,7 @@ Each type below has 2 anomalies in val and 2 in test, and at least 3 in train (u
 | Type | Sensor | Real-world meaning | Injection |
 |---|---|---|---|
 | `temp_spike` | temp | Sensor glitch | 1–3 min jump of ±3–8 °C |
-| `heating_failure` | temp | Boiler fault | Falls 0.5–1.0 °C/h for 1.5–3 h (≥ 1.5 °C total) while the setting is 21 °C. Label includes the recovery |
+| `heating_failure` | temp | Boiler fault | Falls 0.5–1.0 °C/h for 1.5–3 h (≥ 1.5 °C total) while the setting is 21 °C. Label includes the recovery. **Contextual:** normal night/eco cooling starts at ~0.6 °C/h, overlapping the slowest failures, so the rate alone is not enough; it matters only when the room should be at 21 °C |
 | `fridge_power_loss` | fridge | Unplugged / failed | 0–0.5 W for 45–120 min |
 | `compressor_stuck_on` | fridge | Door ajar / refrigerant leak | Constant 100–130 W for 1–2 h (a normal run is ≤ 18 min) |
 | `intrusion_motion` | motion | Intruder | Motion in 30–60% of minutes for 5–30 min while the house is empty (Tue–Thu), with no door opening |
@@ -148,10 +148,23 @@ All models use **one detector per sensor**. This keeps alerts attributed and exp
 
 | Model | How it works | What is learned / tuned |
 |---|---|---|
-| **Rules** | Spike: \|`temp_resid`\| > 1.5 °C. Heating failure: below usual and falling, held for 15 min. Fridge: < 1 W for 10 min, or running > 30 min. Intrusion: motion in the configured *away* hours with no door opening for D min. Door: open in the configured *night* hours, or open > 10 min | Thresholds from physics, house rules or gaps in **unlabelled** train data (e.g. no train fridge minutes between 0.75 and 1.0 W). 3 values tuned on val |
+| **Rules** | Spike: \|`temp_resid`\| > 1.5 °C. Heating failure: below usual and falling, held for 15 min. Fridge: < 1 W for 10 min, or running > 30 min. Intrusion: motion in the configured *away* hours with no door opening for D min. Door: open in the configured *night* hours, or open > 10 min | Thresholds from physics, house rules or gaps in **unlabelled** train data (e.g. no train fridge minutes between 0.75 and 1.0 W; no train compressor runs between 22 and 60 min). 3 values tuned on val |
 | **Isolation Forest v1** | One forest per sensor on its features plus hour and day-type columns | Threshold = percentile of train scores, tuned on val |
 | **Isolation Forest v2** | 2–3 sensor-specific inputs. Context comes as a learned activity rate per (day type, hour) instead of generic time columns. `max_samples` = 1024 | Same as v1 |
 | **Control charts** | EWMA or CUSUM on standardised signals: temperature below usual (`temp_dev`), fridge power and run length per mode, motion/door relative to their learned hourly rate. Charts measure sustained **shifts**; spikes are left to the rules | Centres, scales and rates from train. Chart type and limit per sensor tuned on val (λ = 0.2, k = 0.5 fixed) |
+
+**Trade-offs: why these four were compared**
+
+| | Rules | Control charts | Isolation Forest v2 | Isolation Forest v1 |
+|---|---|---|---|---|
+| **Role** | Simple, explainable baseline | Classic lightweight drift detector | Fair revision of v1 (focused inputs) | Standard unsupervised method for tabular data |
+| **Errors (val / test)** | 0 / 0 (upper bound) | 7 / 5 | 9 / 10 | 13 / 16 |
+| **Strength** | Catches every type, including context-dependent ones (intrusion, night door) | Fastest on gradual and sustained anomalies (heating ~21 vs ~59 min, fridge) | Better than v1 with the same false alarms; catches spikes and door left open | Generic: one method for every sensor, no hand-written rules; learns from unlabelled data |
+| **Weakness** | Designer bias: thresholds and schedule mirror the simulator | Misses short or purely time-of-day anomalies; false alarms when temperature runs below its usual level | Misses duration and context anomalies (stuck-on, intrusion, night door) | Inputs diluted by context columns; scores each minute independently |
+| **Needs a schedule** | Yes, hand-written away/night windows | No (learned rates) | No (learned rates) | No (hour / day-type columns) |
+| **Size / speed** | 3 KB · 0.0005 ms/min | 14 KB · 0.006 ms/min | 20.9 MB · 0.027 ms/min | 11.5 MB · 0.023 ms/min |
+| **Explainability** | Rule + threshold ("compressor running > 30 min") | Chart + signal + side ("EWMA of temp_dev below −6 σ") | Most extreme feature vs train (SHAP as extension) | Same as v2 |
+| **Maintenance** | Manual: user/engineer updates the schedule and thresholds when routines change | Automatic: refit KB-sized centres, scales and rates; limits stay | Refit MB-sized forests and re-check the threshold | Same as v2 |
 
 **Why these four:**
 - **Rules** are the simple, explainable baseline: tiny and instant, and each alert reads like "compressor running > 30 min". **Weakness:** they need a hand-written away/night schedule, and the same person designed both the rules and the simulator.
@@ -172,7 +185,7 @@ All models use **one detector per sensor**. This keeps alerts attributed and exp
 
 **Production recommendation: a hybrid** (details in §9). It is assembled from the evaluated per-sensor detectors and was not scored as one combined system.
 - **EWMA control charts for fridge power and heating drift.** They were faster on val (heating failure ~21 vs ~59 min, power loss 4.5 vs 9 min) and need no hand-written schedule.
-- **Rules for door and motion,** where the anomaly depends on the time of day and charts cannot see it.
+- **Rules for temperature spikes, door and motion.** Spikes are not a chart target, and door and motion anomalies depend on the time of day, which charts cannot see.
 - **A further extension:** chart residuals from a context-adjusted expected value instead of raw readings.
 
 ---
@@ -237,7 +250,7 @@ The PoC selected the rules on val. Their score is an upper bound, because their 
 | Door | Rules (night opening, left open > 10 min) | Same: night openings are short and purely time-of-day |
 
 - **Built from evaluated parts:** each detector is the val-tuned component already saved. Detectors are independent per sensor, so the hybrid is a per-sensor choice and needs no new model.
-- **Not evaluated as a combined system:** the temperature combination (chart plus spike rule) was never scored together. The hybrid was chosen from val results, not from test, and should be validated on fresh data before release (the §9 gate).
+- **Not evaluated as a combined system:** the temperature combination (chart plus spike rule) was never scored together. The hybrid was chosen from val results, not from test, and should be validated on fresh data before release (the release gate below).
 - **Next step:** chart residuals from a context-adjusted expected value instead of raw readings.
 
 **Serving: real time, on-device.**
@@ -281,7 +294,7 @@ The PoC selected the rules on val. Their score is an upper bound, because their 
 - **One season, one household, no daylight-saving change.** The baselines would need refitting across seasons.
 - **Contaminated train:** unlabelled anomalies in train make long fridge runs and door openings look less rare to Isolation Forest.
 - **Future work:**
-  - the hybrid model and context-adjusted chart residuals (§6);
+  - scoring the hybrid as one combined system, and context-adjusted chart residuals (§6, §9);
   - a Bernoulli or Poisson CUSUM on motion/door counts. The current charts standardise the binary readings as if they were Gaussian, so the chart limits have no exact false-alarm meaning. A count-based likelihood-ratio CUSUM fits binary and count data properly;
   - SHAP explanations for Isolation Forest (`shap.TreeExplainer`) instead of the "most extreme feature" explanation;
   - a streaming-equals-batch test;
@@ -319,4 +332,6 @@ The work followed a stage-by-stage plan ([`docs/plan.md`](docs/plan.md)). At eac
 | `002_synthetic_data_generation.txt` | Repo structure, dataset design and generation |
 | `003_cleaning_and_eda.txt` | Cleaning, features and EDA |
 | `004_modelling_eval.txt` | Model comparison and validation |
-| `005_*.txt` | Test evaluation and README (exported at the end) |
+| `005_readme_design.txt` | Test evaluation and README |
+| `006_reviewer_check.txt` | External Reviewer |
+| `final_transcript.txt` | Whole Workflow Session |
