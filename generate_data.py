@@ -291,17 +291,18 @@ def solar_gain(tod):
     return t["solar_gain"] * np.sin(np.pi * phase)
 
 
-def temperature_physics(target, solar, fall_rate):
+def temperature_physics(target, solar, fall_rate, initial=None):
     """Noise-free room temperature.
 
     First-order lag towards target + solar gain: fast when heating, slow when cooling.
     Heating failure overrides with a steady fall (fall_rate in degC/hour, NaN = heating works).
+    initial: starting temperature (default: the first target).
     """
     t = cfg.TEMPERATURE
     alpha_heat = 1.0 / t["lag_heat_minutes"]
     alpha_cool = 1.0 / t["lag_cool_minutes"]
     temp = np.empty(len(target))
-    current = target[0]
+    current = target[0] if initial is None else initial
     for i in range(len(target)):
         if np.isnan(fall_rate[i]):
             goal = target[i] + solar[i]
@@ -310,6 +311,15 @@ def temperature_physics(target, solar, fall_rate):
             current -= fall_rate[i] / 60.0
         temp[i] = current
     return temp
+
+
+def settled_start_temperature(target, solar):
+    """Burn-in: run day 1's schedule once and return its end-of-day (midnight) temperature.
+
+    Avoids a start-up artifact where the series begins at the 18 degC setback.
+    """
+    day = slice(0, MIN_PER_DAY)
+    return temperature_physics(target[day], solar[day], np.full(MIN_PER_DAY, np.nan))[-1]
 
 
 def add_sensor_noise(values, sd, rng):
@@ -587,8 +597,9 @@ def main():
 
     # Temperature: noise-free with and without failures, then label the recovery
     solar = solar_gain(tod)
-    temp_failed = temperature_physics(target, solar, heating_fall_rate(anomalies, len(index)))
-    temp_normal = temperature_physics(target, solar, np.full(len(index), np.nan))
+    start_temp = settled_start_temperature(target, solar)
+    temp_failed = temperature_physics(target, solar, heating_fall_rate(anomalies, len(index)), start_temp)
+    temp_normal = temperature_physics(target, solar, np.full(len(index), np.nan), start_temp)
     extend_heating_labels(anomalies, temp_failed, temp_normal)
 
     # Normal behaviour for the other sensors

@@ -189,6 +189,93 @@ Placed **per split**, so train, val and test all contain the same kinds of data-
 
 ---
 
+## Stage 4 – Cleaning & EDA
+
+### Data scope (leakage rules)
+
+| EDA part | Data used |
+|---|---|
+| Sensor behaviour (time series, daily/weekly profiles, distributions) | Train only |
+| Data-quality checks (missing values, duplicates, gaps, timestamp consistency) | All splits (mechanical, same as production) |
+| Anomaly counts / affected minutes per type and sensor | All splits, from `anomaly_labels.csv` (documentation only) |
+| Plots of injected anomalies | Train only |
+
+- Val and test readings are not visually inspected before final evaluation.
+- **Any parameter learned from data (e.g. scaling statistics) is fit on train only** and then applied unchanged to val/test and the production stream. Nothing is ever re-fit on val/test.
+
+### Cleaning policy
+Every step is causal (past data only), so the same code serves batch and streaming.
+
+| Step | Check | Action |
+|---|---|---|
+| 1 | Timestamp order | Sort; in a stream, ignore rows older than the last seen |
+| 2 | Duplicate timestamps | Keep first |
+| 3 | Gaps (hub outage) | Reindex to a regular 1-min grid; missing rows become NaN |
+| 4 | Physically impossible values | Set to NaN, using fixed hardware limits (not learned) |
+| 5 | Short gaps | Forward-fill, **at most 2 min** (all sensors) |
+| 6 | Longer gaps | Leave NaN, flag sensor **offline**, skip detection for that sensor. Reported as data quality, not anomalies |
+
+- **Outliers are not clipped or removed in cleaning.** They are the detection targets (e.g. `temp_spike`). Learned limits belong to the detectors.
+- No interpolation, because it would use future values.
+
+### EDA plots (train only; train labels used for shading and normal-vs-anomalous splits)
+1. One train week, 4 stacked sensor panels, anomalies shaded by type.
+2. Daily profile by day type (Tue–Thu / Mon & Fri / weekend).
+3. Distributions, normal vs anomalous minutes, per sensor.
+4. Fridge run lengths per mode, normal vs anomalous.
+
+Plus tables: a data-quality summary per split, and anomaly counts / affected minutes by type and sensor.
+
+### Preprocessing (implemented in `features.py`, all causal)
+
+| Sensor | Features |
+|---|---|
+| Temperature | **Deviation from the train baseline** (`temp_dev`, median for this hour × baseline group). **Residual from recent readings** (`temp_resid` = reading − 15-min rolling median). Rate of change over 15 and 60 min (°C/h), computed on the **15-min rolling median** |
+| Fridge | Mode from **fixed thresholds**: idle < 50 W, running 50–200 W, defrost ≥ 200 W (not tuned). Minutes in current mode |
+| Motion | Motion minutes in the last 15 and 60 min |
+| Door | Minutes the door has been open. **Minutes since the door was last open** (capped at 180 min) |
+| All | Hour of day, day type (`tue_thu`, `mon_fri`, `weekend`) |
+
+- **Temperature baseline:** the thermostat target (21 °C) is not observed by any sensor, so the expected level is learned. It is the median temperature per hour × **baseline group** on **train only**, fit once and then applied unchanged to val/test.
+  - **Baseline groups:** `tue_thu` (eco mode) vs `occupied` (Mon/Fri + weekend). The three day types are kept for the other features.
+  - **Why pooled:** with 3 day types, train has only 4 weekend days, and 2 of them have heating failures. Up to **50%** of the minutes in some weekend-evening medians were failure minutes, which pulled the weekend 18–19 h baseline ~0.2 °C low. Pooling gives 8 days per hour; the worst cell is now **25%** contaminated (occupied, 18 h). The occupied 18–19 h baseline is 21.17 / 21.14 °C.
+  - It uses the median **without labels**, because a real system has no labels.
+  - This is the only learned preprocessing parameter.
+- **Spike residual (`temp_resid`):** `temp_dev` alone can hide a weak spike (e.g. +3 °C during a warm-up lag at −1.8 °C lands inside the normal range). The residual from the 15-min rolling median is independent of context.
+  - Normal train: std 0.12 °C, range −0.46 to +0.60 °C.
+  - Train spikes: −4.11, +3.62, +3.75 / +3.57 °C.
+- **Cross-sensor door link (`minutes_since_door_open`):** intrusion is defined as motion without door entry, so motion needs a link to door activity.
+  - **Cross-sensor features are unknown (NaN) when a sensor they depend on was offline since the last event; the detector skips them.** For example, a return home during a door outage would otherwise look like motion with no entry, i.e. an intrusion.
+  - Capped at 180 min (= warm-up length), so the value never depends on how much history is loaded. The reviewer suggested NaN until the first opening; the cap keeps warm-up and continuous runs identical.
+  - Train intrusion motion minutes: 95–180 min since the door was last open.
+  - Normal motion in Tue–Thu 09–17 h: 28 of 49 minutes are ≤ 5 min after a door opening (returns home). 5 minutes are > 30 min after one (3 stray triggers, 2 at 17:58–17:59 after an earlier return).
+- **Label-split statistics are descriptive only.** Detector thresholds come from physics, or from unlabelled train distributions (e.g. high quantiles), and are tuned on val. The label-split numbers in the EDA findings (e.g. idle ≤ 30 vs 72–137 min) must not be copied into thresholds.
+- **Fridge mode thresholds** are fixed from the physics (idle ≤ ~5 W, compressor 100–130 W, defrost ~300 W), with no tuning. Power loss appears as idle mode with an unusually long run and a near-0 W value.
+- **No scaling:** the rules use physical units and Isolation Forest is scale-invariant. If a later model needs scaling, it is fit on train only.
+- **Smoothed temperature rate:** a single-reading difference over 15 min is dominated by sensor noise (std 0.56 °C/h on stable normal minutes). Comparing 15-min rolling **medians** gives a std of 0.18 °C/h.
+  - A rolling mean was slightly smoother (0.14 °C/h), but a spike leaked into the rate for up to 30 min afterwards (normal-minute minimum −2.51 °C/h). The median ignores 1–3 min spikes (minimum −1.24 °C/h).
+  - With the median, `temp_rate_60` during a heating failure reads close to the true fall rate (−0.62 to −0.66 vs 0.65–0.69 °C/h).
+- **Split-start warm-up:** val/test features are built with the last 180 min of the previous split prepended (`split_features`), then trimmed.
+  - Verified: the first hour of val and test is identical to one continuous run over all 28 days (all 15 numeric features). Without warm-up it has 93 NaN and 115–128 wrong feature cells.
+  - The warm-up rows are past data (a live stream has them) and are never used to fit anything.
+  - Train has no earlier split, so its first hour stays without history.
+- **Generator start-up fix:** the temperature simulation now starts from a settled midnight value (a burn-in run of day 1's schedule) instead of the 18 °C setback. Mon 8 Jan 00–07 h now averages 19.33 °C vs 19.36 °C on other nights (was ~18 °C). It uses no random numbers, so all other data and every label are unchanged.
+
+All feature statistics quoted above (residual, door link, baseline contamination, rate noise, warm-up) are reproduced in `analysis.ipynb`, section 5 "Feature checks".
+
+### EDA findings (from `analysis.ipynb`, plots in `outputs/eda/`)
+- **Data quality:** per split there are 2 duplicate rows, 1 hub outage (26 / 40 / 33 missing rows) and 0 out-of-order timestamps. Cleaning detects exactly 2 offline periods per sensor per split, matching the generation log. Offline minutes = logged minutes − 2 per outage (the forward fill).
+
+| Sensor | Observation (train) | Implication for detection |
+|---|---|---|
+| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Train spikes at −4.3 / +3.5 to +3.7 °C deviation vs normal −1.8 to +1.5 °C. Heating failure + recovery spans −2.1 to +0.1 °C, overlapping normal | `temp_resid` catches spikes in any context. Heating failure needs duration / rate in context |
+| Motion (cross-sensor) | Intrusions happen 95–180 min after the last door opening; most normal empty-hours motion is ≤ 5 min after one | `minutes_since_door_open` + expected-empty context |
+| Fridge | No daily pattern. Stuck-on power equals normal running. Power loss ≤ 0.6 W vs idle ≥ 1.1 W | **Mode duration** separates: normal idle ≤ 30, running ≤ 22 min vs anomalous 72–137 / 77–93 min |
+| Motion | ~0 Tue–Thu 09–16 h. Intrusion counts overlap normal home activity | Needs context (expected empty house) |
+| Door | Normal openings ≤ 4 min, `door_left_open` up to 41 min. Night openings have normal duration | Duration for left-open; time of day for night |
+
+---
+
 ## README Carry-Over
 Items to include in README.md when it is written at the end:
 
@@ -209,6 +296,14 @@ Items to include in README.md when it is written at the end:
   - intrusions always have ≥2 motion minutes
 
   Mention this as part of the process.
+- **Cleaning & features:**
+  - Causal throughout; only short gaps are filled (2 min); outliers are kept.
+  - The train-only temperature baseline (2 groups, pooled to limit contamination) is the only learned preprocessing parameter.
+  - `temp_resid` isolates spikes; `minutes_since_door_open` gives the cross-sensor intrusion link.
+  - Label-split statistics are descriptive only; thresholds never come from labels.
+  - Fridge modes come from fixed thresholds.
+  - The temperature rate uses a rolling median.
+  - Val/test get a 180-min warm-up from the previous split.
 - **Heating failure is contextual:** normal setback cooling (~0.6 °C/h at its start) overlaps the slowest failures. The rate of fall alone is not enough; the detector needs the context (target 21 °C, awake and home).
 - **Productionization:** on-device serving. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
 - **AI transcripts:** exported per phase into `ai_transcripts/`.
