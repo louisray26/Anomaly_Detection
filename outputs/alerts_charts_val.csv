@@ -1,0 +1,17 @@
+sensor,model,start,end,reason
+power_fridge,charts,2024-01-22 18:13:00,2024-01-22 19:58:00,EWMA of power_fridge below -6 sigma
+power_fridge,charts,2024-01-23 01:07:00,2024-01-23 01:48:00,EWMA of fridge_mode_minutes above +6 sigma
+power_fridge,charts,2024-01-23 06:11:00,2024-01-23 08:36:00,EWMA of power_fridge below -6 sigma
+temp_living_room,charts,2024-01-24 07:03:00,2024-01-24 07:21:00,EWMA of temp_dev below -6 sigma
+door_front,charts,2024-01-24 20:56:00,2024-01-24 20:56:00,CUSUM of door_front above +80 (CUSUM h)
+door_front,charts,2024-01-24 21:17:00,2024-01-24 21:17:00,CUSUM of door_front above +80 (CUSUM h)
+motion_hallway,charts,2024-01-25 16:56:00,2024-01-25 16:56:00,CUSUM of motion_hallway above +80 (CUSUM h)
+temp_living_room,charts,2024-01-26 10:39:00,2024-01-26 14:35:00,EWMA of temp_dev below -6 sigma
+power_fridge,charts,2024-01-27 05:13:00,2024-01-27 06:09:00,EWMA of fridge_mode_minutes above +6 sigma
+motion_hallway,charts,2024-01-27 23:05:00,2024-01-27 23:05:00,CUSUM of motion_hallway above +80 (CUSUM h)
+temp_living_room,charts,2024-01-28 08:17:00,2024-01-28 12:23:00,EWMA of temp_dev below -6 sigma
+door_front,charts,2024-01-28 19:59:00,2024-01-28 19:59:00,CUSUM of door_front above +80 (CUSUM h)
+door_front,charts,2024-01-28 20:11:00,2024-01-28 20:11:00,CUSUM of door_front above +80 (CUSUM h)
+door_front,charts,2024-01-28 20:23:00,2024-01-28 20:23:00,CUSUM of door_front above +80 (CUSUM h)
+door_front,charts,2024-01-28 20:35:00,2024-01-28 20:35:00,CUSUM of door_front above +80 (CUSUM h)
+door_front,charts,2024-01-28 20:47:00,2024-01-28 20:47:00,CUSUM of door_front above +80 (CUSUM h)

@@ -276,6 +276,180 @@ All feature statistics quoted above (residual, door link, baseline contamination
 
 ---
 
+## Stage 5 – Model Comparison
+
+### Structure: one detector per sensor (all models)
+- Alerts are attributed to a sensor by construction ("correct sensor" metric).
+- An offline sensor only disables its own detector.
+- Alerts are explainable per sensor.
+- Cross-sensor context enters as features (e.g. `minutes_since_door_open`).
+
+| Detector | Inputs |
+|---|---|
+| Temperature | `temp_dev`, `temp_resid`, `temp_rate_15`, `temp_rate_60`, hour, day type |
+| Fridge | `power_fridge`, `fridge_mode`, `fridge_mode_minutes` (no time context: no daily pattern in EDA) |
+| Motion | `motion_15`, `motion_60`, `minutes_since_door_open`, hour, day type |
+| Door | `door_open_minutes`, hour, day type |
+
+### Rule-based baseline
+Each rule outputs a flag plus a readable reason. Thresholds come from physics, house rules, or valleys in **unlabelled** train distributions, never from labels. Only d, r and D are tuned on val.
+
+| Sensor | Rule | Condition | Threshold source |
+|---|---|---|---|
+| Temperature | Spike | \|`temp_resid`\| > 1.5 °C | Physics (a room can't jump 1.5 °C in minutes); normal resid ≤ 0.6 °C |
+| Temperature | Heating failure | `temp_dev` < −d and `temp_rate_60` < −r, sustained 15 min | **Tuned on val** |
+| Fridge | Power loss | Power < 1 W for 10 min | Valley in unlabelled train power: 0 minutes in 0.75–1.0 W, between the ~0 W cluster (269 min) and idle (≥ 1.0 W) |
+| Fridge | Stuck on | Running > **30 min** | Gap in unlabelled train running periods: q99 = 22 min, none between 22 and 60 min |
+| Motion | Intrusion | During configured away hours: `motion_15` ≥ 2 and no door opening in the last D min | **Tuned on val** (D). ≥ 2 ignores single stray triggers |
+| Door | Left open | Open > 10 min | House rule |
+| Door | Night opening | Door opens during configured night hours | Schedule |
+
+- **Configured schedule (Option A):** away = Tue–Thu 09:00–17:00, night = 00:00–05:00, in `config.py`. It mimics a user's "away / night mode" settings.
+- **Only the rule baseline gets the schedule.** The ML models (Isolation Forest, and any later model) do **not**; they must learn context from hour and day type in the data. This is a deliberate contrast between the two approaches.
+- Option B (learning quiet hours from motion) was rejected: motion alone cannot tell an empty house from a sleeping one, so night bathroom trips would trigger intrusion alerts.
+- The 1 W and 30 min evidence is reproduced in `analysis.ipynb` section 5 (check 5.6).
+- **Circularity caveat (reviewer):** the configured schedule matches the generator's injection windows (away Tue–Thu 09–17 ≈ intrusion window; night 00–05 ≈ `door_open_night` 00:30–05:00), and `motion_15` ≥ 2 mirrors the generator's guarantee of ≥ 2 intrusion motion minutes. The same designer wrote both, so **rule recall is an upper bound**. The ML models and charts get none of this. Checked with a schedule sensitivity run (see results).
+
+### Isolation Forest
+
+| Aspect | Decision |
+|---|---|
+| Models | 4 per-sensor Isolation Forests with the Topic 1 inputs |
+| Training data | Unlabelled train (contains unlabelled anomalies) |
+| Encoding | Hour as sin/cos; day type and fridge mode one-hot |
+| Settings | 200 trees, default `max_samples`, `random_state` = config seed; no hyperparameter tuning |
+| Threshold | `contamination` is **not** used to set the cut-off. The per-sensor threshold on `score_samples` is **tuned on val**, starting from a high percentile of train scores |
+| Missing inputs | Any NaN input (offline sensor, unknown `minutes_since_door_open`) → that detector skips the minute |
+| Explanation | Each alert reports its most extreme input feature compared with the train distribution (e.g. "fridge_mode_minutes = 85, above 99.9% of train"). SHAP is a README extension |
+
+### Isolation Forest v2 (one fair revision; no further iteration)
+Reason: v1 inputs were diluted by 5 generic context columns.
+| Aspect | Decision |
+|---|---|
+| Inputs | temp: `temp_dev`, `temp_resid`, `temp_rate_60` · fridge: `power_fridge`, `fridge_mode_minutes` · motion: `motion_15`, `minutes_since_door_open`, `motion_usual` · door: `door_open_minutes`, `door_usual` |
+| Learned context | `motion_usual` / `door_usual` = share of active minutes per (day type, hour) on train, Laplace-smoothed (+0.5 / +1). No labels and no configured schedule are used |
+| Settings | 200 trees, `max_samples` = 1024 (v1: 256); same threshold grid and tuning as v1 |
+
+### Control charts (EWMA / CUSUM)
+Reason: classic, lightweight, and less designer-biased than rules; expected to suit gradual drifts (heating failure).
+| Aspect | Decision |
+|---|---|
+| Signals (z-scores) | temp: `temp_dev` only (lower side, median/MAD per baseline group × hour). Charts measure **shifts**; spikes are the rule's job, so `temp_resid` is not a chart signal · fridge: `power_fridge` (two-sided) and `fridge_mode_minutes` (upper), both median/MAD per fridge mode · motion / door: 0/1 reading standardised by its learned per-(day type, hour) rate, `(x − p) / √(p(1 − p))`, upper side |
+| Fit on train | Centres, scales (MAD × 1.4826, with floors: temp_dev 0.1 °C, power 0.5 W, run length 1 min) and rates. Unlabelled train |
+| Fixed constants | EWMA λ = 0.2 (limit in asymptotic EWMA σ); CUSUM k = 0.5 |
+| Tuned on val | Chart type (EWMA or CUSUM) and limit per sensor: EWMA L ∈ {3, 4, 5, 6, 8}; CUSUM h ∈ {5, 10, 20, 40, 80}. Same objective and tie-breaks |
+| Details | CUSUM restarts at 0 after a signal (without this, one heating failure kept the chart above the limit for 2.5 days). Missing minutes hold the chart state. A sensor alerts when any of its signals crosses the limit. Reason = chart + signal + side |
+
+### Minute flags → alerts (all models)
+- An alert starts at the first flagged minute, which is when it is sent in real time.
+- Flagged minutes on the same sensor < 10 min apart are merged into one alert. Merging only extends an alert already sent.
+- Alert record: `sensor, model, start, end, reason`, written to `outputs/alerts_<model>_<split>.csv` (the task's "detected anomalies" output).
+- No minimum alert length; persistence lives inside the rules that need it. To be revisited for IF only if val shows many 1-minute false alarms.
+
+### Scoring, tuning and selection (val)
+**Scoring rules**
+- **Hit:** an alert on the anomaly's sensor overlapping [anomaly start, anomaly end + **15 min grace**].
+- **False alarm:** an alert on its sensor overlapping no anomaly (+ grace) on that sensor.
+- **Cross-sensor alarm:** an alert on a *different* sensor during an anomaly counts as a false alarm and is also reported separately.
+- **Benign-event alarms:** false alarms overlapping a benign event (from `generation_log.csv`) are reported separately, but still count as false alarms.
+
+**Tuning (per sensor)**
+- Objective: minimise **misses + false alarms** (equal cost, Stage 1).
+- Tie-break 1: lower median detection delay. Tie-break 2: the more conservative setting.
+- Grids: rules d ∈ {0.5, 0.75, 1.0} °C, r ∈ {0.2, 0.3, 0.4} °C/h, D ∈ {15, 30, 60} min. IF threshold at train-score percentiles {99.0, 99.5, 99.9, 99.95, 99.99}.
+- Risk: only 2–4 val anomalies per sensor, so tuning can overfit. Small grids and conservative ties limit this; test gives the honest number.
+
+**Selection**
+- **One model overall**, chosen by total errors (misses + false alarms) on val across all sensors. Per-sensor results are reported alongside.
+
+**Comparison table:** detection per sensor/type, false alarms (total, per day, cross-sensor, on benign events), median delay, model size, **inference time per minute**, number of tuned parameters, explainability.
+
+### Val results (first run: rules vs IF v1 only; kept for history, superseded below)
+
+| Model | Detected | False alarms | Benign FA | Cross-sensor FA | Total errors | Size | ms / minute | Tuned params |
+|---|---|---|---|---|---|---|---|---|
+| Rules | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0006 | 3 |
+| Isolation Forest | 4/14 | 3 | 2 | 0 | 13 | 11,477 KB | 0.019 | 4 |
+
+- **Tuned rules:** d = 0.5 °C, r = 0.2 °C/h, D = 60 min. All rule grid points tied on errors; the tie-break chose the lowest delay.
+- **Tuned IF percentiles:** temp p99.95, fridge p99.9, motion p99.99, door p99.99.
+- **Median delay (rules):** temp 27.5, fridge 15.5, motion 2, door 5 min.
+- **IF detected only** heating failure 2/2 and power loss 2/2 (delay ~95–131 min). It missed spikes, stuck-on, intrusion, and both door types.
+- **Selected: rules** (fewest total val errors).
+
+- **Known limitation:** IF scores each minute independently. Duration is only captured where a feature encodes it (`fridge_mode_minutes`, `door_open_minutes`, `temp_rate_60`).
+
+### Val results (all four models, seed 42; `outputs/val_*.csv`)
+
+| Model | Detected | False alarms | Benign FA | Cross-sensor FA | Total errors | Size | ms / minute | Tuned params |
+|---|---|---|---|---|---|---|---|---|
+| Rules | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0004 | 3 |
+| Control charts | 9/14 | 2 | 1 | 0 | 7 | 14 KB | 0.006 | 8 |
+| IF v2 | 8/14 | 3 | 2 | 0 | 9 | 20,864 KB | 0.023 | 4 |
+| IF v1 | 4/14 | 3 | 2 | 0 | 13 | 11,482 KB | 0.018 | 4 |
+
+- **Tuned:** IF v2 percentiles temp p99.95, fridge p99.5, motion p99.95, door p99.5. Charts: temp EWMA 6, fridge EWMA 6, motion CUSUM 80, door CUSUM 80.
+- **IF v2 vs v1:** +4 detections (temp spikes 2/2, door left open 2/2), same false alarms. Still misses stuck-on, intrusion and night door openings. Size nearly doubled (larger `max_samples`).
+- **Charts per sensor:**
+  - Fridge: 4/4, 0 FA (EWMA 6; delay 10 min, faster than rules' 15.5).
+  - Temperature (`temp_dev` lower side only): heating failures 2/2, spikes 0/2 by design, 1 FA (Wed 01‑24 07:03–07:21, temperature below the usual 07:00 Tue–Thu level, likely a late morning heat-up). **Heating failure: charts ~21 min vs rules ~59 min** (rules need 15 sustained minutes of both dev and rate conditions; the chart accumulates evidence from the first minutes).
+  - Motion: 1/2 at CUSUM 80; lower limits catch both but add 5–63 FA. 1 FA on weekend guests.
+  - Door: left open 2/2, night openings 0/2. A 1–2 min night opening adds too little to the chart before it ends; limits that catch it add 3–19 FA.
+- **Selected: rules** (still fewest total val errors), subject to the circularity caveat (rule recall is an upper bound).
+
+**Median detection delay per anomaly type (min; `outputs/val_per_type.csv`)**
+
+| Anomaly type | Rules | Charts | IF v2 | IF v1 |
+|---|---|---|---|---|
+| temp_spike | 0 | – (not a chart signal) | 0 | – |
+| heating_failure | 59 | **21** | 86.5 | 131 |
+| fridge_power_loss | 9 | **4.5** | 91 | 95 |
+| compressor_stuck_on | 26 | **19** | – | – |
+| intrusion_motion | **2** | 3 (1/2) | – | – |
+| door_open_night | **0** | – | – | – |
+| door_left_open | 10 | 4.5 | **3.5** | – |
+
+– = not detected. Per-sensor medians mix types (e.g. rules temp 27.5 = spikes 0 + failures 59), so per-type delay is the number to read.
+
+**Schedule sensitivity (rules only; not used for selection; `outputs/val_sensitivity.csv`)**
+Only the schedule changes: away Tue–Thu 08:00–18:30, night 23:30–06:00 (`config.SCHEDULE_SENSITIVITY`); same grid and tuning (chose the same d, r, D).
+
+| Schedule | Detected | False alarms | Total errors |
+|---|---|---|---|
+| Main (matches injection windows) | 14/14 | 0 | 0 |
+| Wide | 14/14 | 2 (motion; 1 cross-sensor) | 2 |
+
+- Both new FAs are 08:00 on Tue/Wed: adults are still home before leaving (08:00–08:45) and the last door opening was the evening before, so the door link does not suppress them. No new door FAs from the wider night window on val.
+- Reading: rules stay best on val (2 errors vs 7 for charts), but their 0 errors depends on a schedule that fits the household exactly. In a real home the schedule is user-entered and drifts; this is a deployment risk to state in the README.
+
+### Files produced by `detect_anomalies.py` (and why)
+One run writes everything below; all are reproducible from the seed. Test is never loaded, so every file here is train-fit / val-scored only.
+
+**`artifacts/`** – fitted models (each candidate frozen as tuned on val, plus `selected_model.joblib` / `.json` for `inference.py`). Git-ignored: not a required deliverable and rebuilt by running `detect_anomalies.py` (~40 s).
+
+**`outputs/` – val evidence for the comparison (what the design doc and README cite)**
+
+| File | Contents | Why it exists |
+|---|---|---|
+| `alerts_<model>_val.csv` (×4) | One row per alert: sensor, model, start, end, reason | The task's "detected anomalies" output; lets a reviewer check each alert and its explanation against `anomaly_labels.csv` |
+| `val_comparison.csv` | One row per model: detected, misses, FA (total, per day, cross-sensor, benign), total errors, median delay, size, ms/minute, tuned params, explainability | The selection table (one model by total errors) |
+| `val_per_sensor.csv` | Same metrics per model × sensor | Per-sensor reporting required by the selection rule |
+| `val_per_type.csv` | Detected and median delay per model × anomaly type | Per-type recall and delay (reviewer fix: per-sensor medians hid per-type differences) |
+| `val_tuning_log.csv` | Every grid setting tried, per model × sensor, with hits / misses / FA / errors / delay | Transparency of tuning: shows how sensitive each choice is (e.g. IF door p99.0 = 24 FA) |
+| `val_chart_reactions.csv` | Best EWMA vs best CUSUM setting per sensor | Answers "how does each sensor react to each chart" |
+| `val_sensitivity.csv` | Rules per sensor with the main vs the wide schedule | Quantifies the circularity caveat (reviewer fix); not used for selection |
+
+`outputs/eda/` (Stage 4 plots) is written by `analysis.ipynb`, not by this script.
+
+### Stage 5 implementation notes and corrections
+- **Code:** all four models live in `detect_anomalies.py` (sections 2a rules, 2b IF v1/v2, 2c charts), share the alert/scoring/tuning code, and save `artifacts/candidate_<model>.joblib`; the selected one is copied to `selected_model.joblib` (+ `.json`). Tie order for selection: rules → charts → IF v2 → IF v1 (simpler first).
+- **Bug fixed before reporting:** CUSUM did not restart after a signal; after the 01‑26 heating failure the lower sum stayed above the limit for 2.5 days, giving one alert that covered both failures and hid false alarms. Fixed (restart at 0 after a signal).
+- **Reviewer fixes:** (1) circularity caveat written down + schedule sensitivity run; (2) delay now reported per anomaly type. My first chart summary wrongly said heating-failure delay was "about the same as rules"; per-type delays show charts ~27 min vs rules ~59 min.
+- **Chart signal correction (design, not val tuning):** first version also charted `temp_resid`; 9 of its 10 temp FAs were heat-up ramps (06:30–07:10, 17:25–18:15), where readings sit above their lagging 15-min median for many minutes and the chart accumulates them. A chart measures sustained shifts; a 1–3 min spike is a single-minute rule's job, so `temp_resid` was removed and temp charts `temp_dev` (lower side) only. Effect: temp 4/4 hits 10 FA → 2/4 hits (spikes not targeted) 1 FA; charts overall 14 → 7 errors.
+- **Not iterated further (by decision):** IF v2 is the single fair revision; chart constants (λ, k, floors) and grids were not changed after seeing val.
+
+---
+
 ## README Carry-Over
 Items to include in README.md when it is written at the end:
 
@@ -304,6 +478,16 @@ Items to include in README.md when it is written at the end:
   - Fridge modes come from fixed thresholds.
   - The temperature rate uses a rolling median.
   - Val/test get a 180-min warm-up from the previous split.
+- **Rule thresholds from unlabelled data:**
+  - Fridge power loss at < 1 W sits in an empty valley (0 train minutes in 0.75–1.0 W, between the ~0 W cluster and idle at ≥ 1.0 W).
+  - Stuck-on at > 30 min sits in a gap (q99 of running periods = 22 min, none between 22 and 60 min).
+  - Show briefly as evidence that no labels were used.
+- **Explainability extension:** IF alerts currently report the most extreme feature vs train. Future work: SHAP values (e.g. `shap.TreeExplainer` on each IF) for per-feature contributions.
+- **Schedule vs learned context:** the rule baseline uses a user-configured away/night schedule; the ML models get no schedule and learn context from the data.
+- **Circularity caveat (must be stated):** the rule schedule matches the injection windows, so rule recall is an upper bound. Show the schedule sensitivity result (wide schedule: 14/14, 2 FA vs 0) and that a user-entered schedule is a deployment risk.
+- **Model comparison (Stage 5):** rules, IF v1, IF v2 (fewer sensor-specific inputs + learned activity rates), EWMA/CUSUM control charts. Show the val comparison table and the per-type delay table. Key points: charts are fastest on gradual/sustained anomalies (heating failure ~21 vs ~59 min, power loss, stuck-on) and miss short night door openings; they target shifts only (spikes left to rules, after `temp_resid` on heat-up ramps caused 9 FA); IF improves with focused inputs but still misses duration/context anomalies; only rules catch the context-dependent ones, helped by the schedule.
+- **Process notes for Stage 5:** CUSUM restart bug found and fixed before reporting; reviewer caught a misreported delay (per-sensor median hid per-type differences), so delays are now reported per type.
+- **Possible extension:** a hybrid (charts for fridge/heating drift, rules for context-dependent door/motion) — not built.
 - **Heating failure is contextual:** normal setback cooling (~0.6 °C/h at its start) overlaps the slowest failures. The rate of fall alone is not enough; the detector needs the context (target 21 °C, awake and home).
 - **Productionization:** on-device serving. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
 - **AI transcripts:** exported per phase into `ai_transcripts/`.

@@ -150,3 +150,50 @@ DATA_QUALITY = {
     "duplicate_rows_per_split": 2,
     "dropped_reading_rate": 0.001,           # per sensor, single NaN cells
 }
+
+# ============================================================
+# Detection (Stage 5) - see docs/design.md
+# ============================================================
+ARTIFACTS_DIR = ROOT / "artifacts"
+OUTPUTS_DIR = ROOT / "outputs"
+
+# User-configured schedule: used ONLY by the rule baseline, never by ML models
+SCHEDULE = {
+    "away": {"days": [1, 2, 3], "window": (9 * 60, 17 * 60)},   # Tue-Thu 09:00-17:00
+    "night": {"window": (0, 5 * 60)},                           # 00:00-05:00 every day
+}
+# Sensitivity check only (not used for selection): wider windows that no longer match the injection windows
+SCHEDULE_SENSITIVITY = {
+    "away": {"days": [1, 2, 3], "window": (8 * 60, 18 * 60 + 30)},  # Tue-Thu 08:00-18:30
+    "night": {"window": (23 * 60 + 30, 6 * 60)},                  # 23:30-06:00 (wraps midnight)
+}
+
+# Fixed rule thresholds (physics / house rules / unlabelled-train valleys)
+RULES = {
+    "spike_resid_degc": 1.5,
+    "heating_sustain_minutes": 15,
+    "power_loss_watts": 1.0,
+    "power_loss_minutes": 10,
+    "stuck_on_minutes": 30,
+    "intrusion_min_motion_15": 2,
+    "door_left_open_minutes": 10,
+}
+
+# Tuned on val (listed from least to most conservative)
+RULE_GRID = {
+    "heating_dev_degc": [0.5, 0.75, 1.0],
+    "heating_rate_degc_h": [0.2, 0.3, 0.4],
+    "intrusion_no_door_minutes": [15, 30, 60],
+}
+
+IFOREST = {"n_estimators": 200}
+IF_PERCENTILE_GRID = [99.0, 99.5, 99.9, 99.95, 99.99]   # of train scores
+IFOREST_V2 = {"n_estimators": 200, "max_samples": 1024}  # fewer, sensor-specific inputs
+
+# Control charts: fixed textbook constants; only the limit (and chart type) is tuned on val
+CHARTS = {"ewma_lambda": 0.2, "cusum_k": 0.5}
+CHART_GRID = {"ewma": [3, 4, 5, 6, 8], "cusum": [5, 10, 20, 40, 80]}   # least -> most conservative
+
+# Alerts and scoring
+ALERT_MERGE_GAP_MINUTES = 10
+GRACE_MINUTES = 15

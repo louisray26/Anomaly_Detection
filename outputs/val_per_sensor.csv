@@ -1,0 +1,17 @@
+model,sensor,anomalies,hits,misses,false_alarms,cross_sensor_fa,benign_fa,errors,median_delay_min
+rules,temp_living_room,4,4,0,0,0,0,0,27.5
+rules,power_fridge,4,4,0,0,0,0,0,15.5
+rules,motion_hallway,2,2,0,0,0,0,0,2.0
+rules,door_front,4,4,0,0,0,0,0,5.0
+iforest,temp_living_room,4,2,2,1,0,0,3,131.0
+iforest,power_fridge,4,2,2,0,0,0,2,95.0
+iforest,motion_hallway,2,0,2,2,0,2,4,
+iforest,door_front,4,0,4,0,0,0,4,
+iforest_v2,temp_living_room,4,4,0,1,0,0,1,42.0
+iforest_v2,power_fridge,4,2,2,0,0,0,2,91.0
+iforest_v2,motion_hallway,2,0,2,2,0,2,4,
+iforest_v2,door_front,4,2,2,0,0,0,2,3.5
+charts,temp_living_room,4,2,2,1,0,0,3,21.0
+charts,power_fridge,4,4,0,0,0,0,0,10.0
+charts,motion_hallway,2,1,1,1,0,1,2,3.0
+charts,door_front,4,2,2,0,0,0,2,4.5

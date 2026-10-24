@@ -1,0 +1,5 @@
+model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,benign_fa,total_errors,median_delay_min (median over sensors),model_size_kb,ms_per_minute,tuned_params,explainability
+rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0004,3,rule name + threshold (e.g. 'compressor running > 30 min')
+iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0189,4,"most extreme feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%')"
+iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0227,4,most extreme feature vs train
+charts,9/14,5,2,0.29,0,1,7,7.25,14.0,0.0056,8,chart + signal + side (e.g. 'CUSUM of temp_dev below -20')

@@ -1,0 +1,95 @@
+model,sensor,setting,hits,misses,false_alarms,errors,median_delay_min
+rules,temp_living_room,"{""heating_dev_degc"": 0.5, ""heating_rate_degc_h"": 0.2}",4,0,0,0,27.5
+rules,temp_living_room,"{""heating_dev_degc"": 0.5, ""heating_rate_degc_h"": 0.3}",4,0,0,0,29.0
+rules,temp_living_room,"{""heating_dev_degc"": 0.5, ""heating_rate_degc_h"": 0.4}",4,0,0,0,30.5
+rules,temp_living_room,"{""heating_dev_degc"": 0.75, ""heating_rate_degc_h"": 0.2}",4,0,0,0,34.0
+rules,temp_living_room,"{""heating_dev_degc"": 0.75, ""heating_rate_degc_h"": 0.3}",4,0,0,0,34.0
+rules,temp_living_room,"{""heating_dev_degc"": 0.75, ""heating_rate_degc_h"": 0.4}",4,0,0,0,34.0
+rules,temp_living_room,"{""heating_dev_degc"": 1.0, ""heating_rate_degc_h"": 0.2}",4,0,0,0,38.5
+rules,temp_living_room,"{""heating_dev_degc"": 1.0, ""heating_rate_degc_h"": 0.3}",4,0,0,0,38.5
+rules,temp_living_room,"{""heating_dev_degc"": 1.0, ""heating_rate_degc_h"": 0.4}",4,0,0,0,38.5
+rules,power_fridge,{},4,0,0,0,15.5
+rules,motion_hallway,"{""intrusion_no_door_minutes"": 15}",2,0,0,0,2.0
+rules,motion_hallway,"{""intrusion_no_door_minutes"": 30}",2,0,0,0,2.0
+rules,motion_hallway,"{""intrusion_no_door_minutes"": 60}",2,0,0,0,2.0
+rules,door_front,{},4,0,0,0,5.0
+iforest,temp_living_room,p99.0,2,2,12,14,64.0
+iforest,temp_living_room,p99.5,2,2,6,8,78.5
+iforest,temp_living_room,p99.9,2,2,2,4,130.0
+iforest,temp_living_room,p99.95,2,2,1,3,131.0
+iforest,temp_living_room,p99.99,2,2,1,3,139.0
+iforest,power_fridge,p99.0,2,2,15,17,77.0
+iforest,power_fridge,p99.5,2,2,12,14,81.5
+iforest,power_fridge,p99.9,2,2,0,2,95.0
+iforest,power_fridge,p99.95,1,3,0,3,110.0
+iforest,power_fridge,p99.99,1,3,0,3,110.0
+iforest,motion_hallway,p99.0,0,2,6,8,
+iforest,motion_hallway,p99.5,0,2,4,6,
+iforest,motion_hallway,p99.9,0,2,4,6,
+iforest,motion_hallway,p99.95,0,2,3,5,
+iforest,motion_hallway,p99.99,0,2,2,4,
+iforest,door_front,p99.0,4,0,24,24,0.5
+iforest,door_front,p99.5,2,2,3,5,3.5
+iforest,door_front,p99.9,0,4,0,4,
+iforest,door_front,p99.95,0,4,0,4,
+iforest,door_front,p99.99,0,4,0,4,
+iforest_v2,temp_living_room,p99.0,4,0,14,14,29.5
+iforest_v2,temp_living_room,p99.5,4,0,7,7,32.0
+iforest_v2,temp_living_room,p99.9,4,0,1,1,42.0
+iforest_v2,temp_living_room,p99.95,4,0,1,1,42.0
+iforest_v2,temp_living_room,p99.99,0,4,0,4,
+iforest_v2,power_fridge,p99.0,4,0,6,6,62.0
+iforest_v2,power_fridge,p99.5,2,2,0,2,91.0
+iforest_v2,power_fridge,p99.9,1,3,0,3,112.0
+iforest_v2,power_fridge,p99.95,1,3,0,3,120.0
+iforest_v2,power_fridge,p99.99,0,4,0,4,
+iforest_v2,motion_hallway,p99.0,0,2,13,15,
+iforest_v2,motion_hallway,p99.5,0,2,9,11,
+iforest_v2,motion_hallway,p99.9,0,2,5,7,
+iforest_v2,motion_hallway,p99.95,0,2,2,4,
+iforest_v2,motion_hallway,p99.99,0,2,3,5,
+iforest_v2,door_front,p99.0,4,0,14,14,1.0
+iforest_v2,door_front,p99.5,2,2,0,2,3.5
+iforest_v2,door_front,p99.9,1,3,0,3,28.0
+iforest_v2,door_front,p99.95,1,3,0,3,33.0
+iforest_v2,door_front,p99.99,0,4,0,4,
+charts,temp_living_room,ewma 3,2,2,51,53,10.5
+charts,temp_living_room,ewma 4,2,2,18,20,13.5
+charts,temp_living_room,ewma 5,2,2,2,4,18.5
+charts,temp_living_room,ewma 6,2,2,1,3,21.0
+charts,temp_living_room,ewma 8,2,2,1,3,26.5
+charts,temp_living_room,cusum 5,4,0,66,66,11.0
+charts,temp_living_room,cusum 10,2,2,25,27,15.5
+charts,temp_living_room,cusum 20,2,2,8,10,21.5
+charts,temp_living_room,cusum 40,2,2,3,5,29.5
+charts,temp_living_room,cusum 80,2,2,1,3,40.0
+charts,power_fridge,ewma 3,4,0,183,183,5.0
+charts,power_fridge,ewma 4,4,0,61,61,6.5
+charts,power_fridge,ewma 5,4,0,7,7,8.0
+charts,power_fridge,ewma 6,4,0,0,0,10.0
+charts,power_fridge,ewma 8,4,0,0,0,23.5
+charts,power_fridge,cusum 5,4,0,256,256,5.5
+charts,power_fridge,cusum 10,4,0,161,161,8.0
+charts,power_fridge,cusum 20,4,0,40,40,12.5
+charts,power_fridge,cusum 40,4,0,8,8,20.5
+charts,power_fridge,cusum 80,4,0,1,1,35.5
+charts,motion_hallway,ewma 3,2,0,69,69,0.0
+charts,motion_hallway,ewma 4,2,0,40,40,0.0
+charts,motion_hallway,ewma 5,2,0,31,31,0.0
+charts,motion_hallway,ewma 6,2,0,15,15,1.5
+charts,motion_hallway,ewma 8,2,0,8,8,1.5
+charts,motion_hallway,cusum 5,2,0,74,74,0.0
+charts,motion_hallway,cusum 10,2,0,31,31,1.5
+charts,motion_hallway,cusum 20,2,0,8,8,2.0
+charts,motion_hallway,cusum 40,1,1,3,4,1.0
+charts,motion_hallway,cusum 80,1,1,1,2,3.0
+charts,door_front,ewma 3,4,0,21,21,0.0
+charts,door_front,ewma 4,4,0,18,18,0.0
+charts,door_front,ewma 5,4,0,15,15,0.5
+charts,door_front,ewma 6,4,0,13,13,0.5
+charts,door_front,ewma 8,3,1,9,10,1.0
+charts,door_front,cusum 5,4,0,21,21,0.0
+charts,door_front,cusum 10,4,0,14,14,0.5
+charts,door_front,cusum 20,3,1,6,7,1.0
+charts,door_front,cusum 40,2,2,3,5,2.0
+charts,door_front,cusum 80,2,2,0,2,4.5

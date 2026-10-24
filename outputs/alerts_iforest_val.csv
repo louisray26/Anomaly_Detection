@@ -1,0 +1,13 @@
+sensor,model,start,end,reason
+temp_living_room,iforest,2024-01-22 06:56:00,2024-01-22 06:56:00,"temp_dev = 0.97, above 99.6% of train"
+power_fridge,iforest,2024-01-22 19:40:00,2024-01-22 19:52:00,"fridge_mode_minutes = 103.00, above 99.7% of train"
+power_fridge,iforest,2024-01-23 07:45:00,2024-01-23 08:03:00,"fridge_mode_minutes = 105.00, above 99.7% of train"
+temp_living_room,iforest,2024-01-26 11:55:00,2024-01-26 11:55:00,"temp_rate_15 = -1.08, below 99.9% of train"
+temp_living_room,iforest,2024-01-26 12:06:00,2024-01-26 12:06:00,"temp_rate_60 = -0.86, below 100.0% of train"
+temp_living_room,iforest,2024-01-26 12:26:00,2024-01-26 12:36:00,"temp_dev = -2.05, below 99.9% of train"
+temp_living_room,iforest,2024-01-26 13:13:00,2024-01-26 13:23:00,"temp_rate_15 = 2.32, above 99.1% of train"
+temp_living_room,iforest,2024-01-26 13:38:00,2024-01-26 13:38:00,"temp_resid = 0.34, above 99.1% of train"
+motion_hallway,iforest,2024-01-27 22:20:00,2024-01-27 22:21:00,"motion_15 = 11.00, above 99.8% of train"
+motion_hallway,iforest,2024-01-27 22:53:00,2024-01-27 22:55:00,"motion_15 = 11.00, above 99.8% of train"
+temp_living_room,iforest,2024-01-28 10:41:00,2024-01-28 11:06:00,"temp_dev = -2.07, below 99.9% of train"
+temp_living_room,iforest,2024-01-28 11:17:00,2024-01-28 11:21:00,"temp_resid = 0.35, above 99.1% of train"
