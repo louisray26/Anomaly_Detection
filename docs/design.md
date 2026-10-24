@@ -441,6 +441,13 @@ One run writes everything below; all are reproducible from the seed. Test is nev
 
 `outputs/eda/` (Stage 4 plots) is written by `analysis.ipynb`, not by this script.
 
+### Models not tried (decision)
+No forecasting or sequence models (ARIMA/Prophet residuals, LSTM, autoencoders):
+1. **Little data:** 14 train days, with unlabelled anomalies in them.
+2. **Sensor types:** forecasting suits continuous series, and only temperature is one. Motion and door are binary; fridge power is cyclic and better described by mode and run length.
+3. **Hardware:** on-device target, and Isolation Forest was already the largest model (11–21 MB).
+4. **Explainability:** the main requirement; rules and charts give direct reasons.
+
 ### Stage 5 implementation notes and corrections
 - **Code:** all four models live in `detect_anomalies.py` (sections 2a rules, 2b IF v1/v2, 2c charts), share the alert/scoring/tuning code, and save `artifacts/candidate_<model>.joblib`; the selected one is copied to `selected_model.joblib` (+ `.json`). Tie order for selection: rules → charts → IF v2 → IF v1 (simpler first).
 - **Bug fixed before reporting:** CUSUM did not restart after a signal; after the 01‑26 heating failure the lower sum stayed above the limit for 2.5 days, giving one alert that covered both failures and hid false alarms. Fixed (restart at 0 after a signal).
@@ -532,9 +539,11 @@ Items to include in README.md when it is written at the end:
 - **Circularity caveat (must be stated):** the rule schedule matches the injection windows, so rule recall is an upper bound. Show the schedule sensitivity result (wide schedule: 14/14, 2 FA vs 0) and that a user-entered schedule is a deployment risk.
 - **Model comparison (Stage 5):** rules, IF v1, IF v2 (fewer sensor-specific inputs + learned activity rates), EWMA/CUSUM control charts. Show the val comparison table and the per-type delay table. Key points: charts are fastest on gradual/sustained anomalies (heating failure ~21 vs ~59 min, power loss, stuck-on) and miss short night door openings; they target shifts only (spikes left to rules, after `temp_resid` on heat-up ramps caused 9 FA); IF improves with focused inputs but still misses duration/context anomalies; only rules catch the context-dependent ones, helped by the schedule.
 - **Process notes for Stage 5:** CUSUM restart bug found and fixed before reporting; reviewer caught a misreported delay (per-sensor median hid per-type differences), so delays are now reported per type.
+- **Limitations (by construction):** benign events never reach the rule triggers (bathroom trips are motion without door outside away hours; guests' openings are short and before 00:00), so the rules' 0 benign FA is partly designed in. Data-quality issues never overlap anomalies, whereas real failures often come with outages (a power cut stops fridge and hub).
+- **Chart extension:** a Bernoulli/Poisson CUSUM on motion/door counts would fit binary data better than the Gaussian-standardised 0/1 signal used now.
 - **Possible extension:** a hybrid (charts for fridge/heating drift, rules for context-dependent door/motion) — not built.
 - **Heating failure is contextual:** normal setback cooling (~0.6 °C/h at its start) overlaps the slowest failures. The rate of fall alone is not enough; the detector needs the context (target 21 °C, awake and home).
-- **Productionization (text only, Stage 7 skipped):** on-device serving; describe minute-by-minute streaming with the same causal `features.py` and the frozen artifact, and note that a streaming-equals-batch check was not run. Cloud is used for retraining and model updates. Monitoring and retraining strategy still to be written.
+- **Productionization (text only, Stage 7 skipped):** on-device serving; describe minute-by-minute streaming with the same causal `features.py` and the frozen artifact, and note that a streaming-equals-batch check was not run. Statistics are refit on the hub (raw data stays local); the cloud runs the release gate (replay + confirmed incidents), keeps versioned artifacts and handles rollback; shadow mode on the hub before release. Written in README §9.
 - **AI transcripts:** exported per phase into `ai_transcripts/`.
 - **Repo layout:** the tree and a one-line role for each file (Stage 2).
 - **Test results (Stage 6):** show the val-vs-test table and the per-type table; val ranking held on test (rules 0, charts 5, IF v2 10, IF v1 16 errors). Repeat the circularity caveat next to the rules' 0.

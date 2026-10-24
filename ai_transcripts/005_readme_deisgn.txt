@@ -1,0 +1,9159 @@
+ ▐▛███▛█   Claude Code v2.1.309
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   ~\Projects\Anomaly Detection
+
+
+❯ /rename AD_Workflow 
+  ⎿  Session renamed to: AD_Workflow
+
+❯ I am giving you the plan.md that has my instructions to you and the task.md   
+  which contains the original task given to me. Dont start with the code yet    
+  and start with the first Phase Problem Understnding. If something is missing  
+  let me know. This is just a rough plan. One we discuss on each stage and      
+  ddecide lets update the design.md. Is there anything unclear in this setup.   
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I read docs/plan.md and docs/task.md. docs/design.md is empty, so I'll leave
+  it alone until we've agreed on this phase.
+
+  Part A: Gaps in the setup
+
+  Missing from the plan or repo structure
+
+  1. ai_transcripts/ directory. The task requires it and the plan doesn't list
+     it. Claude Code can export a session with /export. The transcripts must be
+     unedited, so export at the end of each session and don't clean them up.
+  2. README.md is in the last stage but not in the file list.
+  3. Shared preprocessing code. The plan puts cleaning decisions in
+     analysis.ipynb. But inference.py has to run the same cleaning and feature
+     steps, and it can't import from a notebook. I suggest one small shared
+     module (e.g. features.py). The notebook would explore and justify the
+     choices, and the module would hold the code.
+  4. Output locations. The task says the code should output the detected 
+     anomalies. I suggest data/ (raw CSV and labels), artifacts/ (saved model
+     and config), and outputs/ (alerts CSV and metrics).
+
+  Things that will affect design later, worth knowing now
+
+  5. Real-time means causal features only. No centered rolling windows and no
+     look-ahead smoothing. Validation and test also need a warm-up buffer
+     carried over from the previous split. Otherwise the first hours of day 15
+     and day 22 get broken features.
+  6. "Correct sensor" vs. Isolation Forest. A single multivariate Isolation
+     Forest gives one score per timestamp, not per sensor. To answer "detected
+     on the correct sensor?", we'll need either one model per sensor or a way to
+     attribute each alert to a sensor. This matters in the model stage, but it
+     also shapes how we label now.
+  7. Small splits. Validation and test are one week each, so each contains one
+     weekend. Training sees only 4 weekend days. With only about 2 events per
+     anomaly type per split, per-type metrics will be noisy. That's fine for a
+     proof of concept, but the README should say so.
+  8. Event-level vs. point-level metrics. Your evaluation questions (events
+     detected, latency, false alarms) are event-level. That's the right choice,
+     and the labels need to support it (see below).
+  9. Minor: you're on master, but the main branch is main.
+
+  Part B: Phase 1 – Problem understanding
+
+  The setting
+
+  - One household with mixed sensors: continuous (temperature, power) and binary
+    (motion, door).
+  - Unsupervised in practice. Real users never label anomalies. Our injected
+    labels exist only for evaluation.
+  - False alarms are the main cost. A DIY user who gets 5 bogus alerts a day
+    turns the system off. So precision and an explanation for each alert matter
+    as much as recall.
+  - Runs on modest hardware (Raspberry Pi or Home Assistant class), so the model
+    should be small and cheap.
+
+  Event vs. anomaly
+
+  - An event is a normal state change or activity: the door opens at 08:15,
+    there's hallway motion in the evening, the fridge compressor starts.
+  - An anomaly is an observation that is unlikely given its context (time of
+    day, day of week, other sensors, recent history).
+  - The same raw reading can be either. A door opening at 08:15 on a weekday is
+    an event. A door opening at 03:10 with no motion beforehand is an anomaly.
+    So detection has to be context-aware, and a plain value threshold won't work
+    for the binary sensors.
+  - Benign rare events sit in between: late-night bathroom trips, guests at the
+    weekend, the fridge defrost cycle. They are not anomalies, but a naive
+    detector will flag them. They are the true test of the false-alarm rate.
+
+  Sensors: normal behaviour and realistic anomalies
+
+  Sensor: Indoor temp (continuous, slow)
+  Normal behaviour: 19–23 °C. Daily cycle from the heating schedule (night
+  setback, morning warm-up), small afternoon solar gain, noise of about ±0.1 °C
+  Realistic anomalies: Heating failure (slow drift down over hours), rapid
+  unexplained rise, stuck/flatlined sensor, single-reading spike (glitch)
+  ────────────────────────────────────────
+  Sensor: Fridge power (continuous, cyclic)
+  Normal behaviour: Compressor runs at about 80–150 W, idles at about 1–5 W.
+  Duty
+  cycle 30–50%, cycles of 20–40 min. Defrost heater spike every 8–12 h. Short
+  bumps when the door is opened
+  Realistic anomalies: Drops to ~0 W (failure or unplugged), compressor never
+  stops (door ajar or refrigerant leak), short cycling, abnormally high draw
+  ────────────────────────────────────────
+  Sensor: Hallway motion (binary per minute)
+  Normal behaviour: Follows occupancy: morning and evening peaks, quiet while
+  away on weekdays, sparse at night
+  Realistic anomalies: Motion while the house should be empty and no door opened
+
+  first (intrusion), sensor stuck on
+  ────────────────────────────────────────
+  Sensor: Front door (binary per minute)
+  Normal behaviour: Mostly closed. Short openings (1–3 min) around leaving and
+  returning
+  Realistic anomalies: Opened at night, left open for a long time (>30 min),
+  opened with no motion before or after
+
+  Anomaly types worth showing a reviewer
+  - Point: a single spike.
+  - Contextual: normal value, wrong time.
+  - Collective: a pattern that is only abnormal because it lasts (stuck value,
+    compressor never stopping).
+  - Cross-sensor: door and motion disagree.
+
+  Proposed injection catalogue (8 types, kept deliberately small)
+
+  ┌─────┬─────────────────────┬─────────────┬───────────────────┬──────────┐
+  │  #  │        Type         │  Sensor(s)  │     Category      │ Duration │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 1   │ Temperature spike   │ temp        │ point / sensor    │ 1–3 min  │
+  │     │                     │             │ fault             │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 2   │ Heating failure     │ temp        │ collective        │ 3–8 h    │
+  │     │ drift               │             │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 3   │ Stuck sensor        │ temp        │ collective /      │ 2–6 h    │
+  │     │                     │             │ sensor fault      │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 4   │ Fridge power loss   │ fridge      │ collective        │ 1–6 h    │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 5   │ Compressor never    │ fridge      │ collective        │ 2–5 h    │
+  │     │ stops               │             │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 6   │ Motion while away,  │ motion      │ contextual /      │ 5–30 min │
+  │     │ no door entry       │             │ cross-sensor      │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 7   │ Door opened at      │ door        │ contextual        │ 1–10 min │
+  │     │ night               │ (+motion)   │                   │          │
+  ├─────┼─────────────────────┼─────────────┼───────────────────┼──────────┤
+  │ 8   │ Door left open      │ door        │ collective        │ 30–120   │
+  │     │                     │             │                   │ min      │
+  └─────┴─────────────────────┴─────────────┴───────────────────┴──────────┘
+
+  - Timing, magnitude and duration are randomised for each event, as your plan
+    asks.
+  - That's about 2 events per type per split, so roughly 16 per split.
+  - Labels: an event-level table (event_id, type, sensor(s), start, end, 
+    magnitude) plus per-minute labels, both stored apart from the measurements.
+
+  Part C: Questions before I write this into design.md
+
+  1. Training contamination. Should the training data contain unlabelled
+     anomalies (realistic, and it tests robustness), or be clean (simpler)? I 
+     recommend contaminated at a lower rate. Real training data is never clean,
+     and both robust rule thresholds and Isolation Forest are built to cope with
+     it.
+  2. Missing data and outages. Your "40,320 before missing observations or
+     outages" suggests you plan gaps. Should a sensor outage count as an anomaly
+     to detect and score, or as a data-quality issue handled in cleaning and
+     reported separately? I recommend the second: simulate a few gaps, have a
+     simple rule raise a "sensor offline" alert, and keep it out of the anomaly
+     metrics.
+  3. Benign rare events. Should we inject unlabelled hard negatives (night
+     bathroom trips, a weekend with guests, defrost cycles)? I recommend yes, 
+     1–2 kinds. Without them the false-alarm numbers will look better than they
+     would in reality.
+  4. Household profile and season. I'd assume one or two working adults: away on
+     weekdays roughly 08:30–17:30 with ±30 min jitter, mostly home at weekends.
+     I'd also assume winter heating season with no daylight-saving change in
+     the 28 days. Does that work, or do you want a different profile (e.g.
+     someone working from home, which makes the "away" rules much harder)?
+  5. Scope of the catalogue. Are 8 types the right size for a 2–10 hour budget?
+     My view: 8 is the upper end of reasonable. If time is tight, I'd drop #3
+     and #5 first.
+
+  Once you've answered, I'll write the Phase 1 decisions into docs/design.md and
+  we can move on to the repo structure.
+
+✻ Cooked for 1m 13s · done Friday 11:45 AM
+
+※ recap: We're building a smart-home anomaly detection proof of concept and are in Phase 1, problem understanding, where I've proposed 8 anomaly types and flagged a few setup gaps. Next, answer my five questions so I can write the agreed decisions into design.md. (disable recaps in /config)
+
+❯ this is just too much in one response. Dont jump to later stages now; we will 
+  be getting to the project repo structure and design later. I have updated     
+  the working principles in plan.md. Re-read it and follow those from now on.   
+  Am talking about the overall flow in plan.md; if there is no big issues that  
+  needs to fixed then lets first start with Porblem Understanding step by step. 
+
+  Read 1 file (ctrl+o to expand)
+
+● I re-read plan.md and will follow the updated principles from here on.
+
+  Issues with the overall flow
+
+  Priority: High
+  Issue: ai_transcripts/ isn't anywhere in the flow
+  Why it matters: The task requires it, and the transcripts must be unedited. I
+  suggest exporting each session (/export) as you go, not at the end.
+  ────────────────────────────────────────
+  Priority: Medium
+  Issue: The task says the detection script must output the detected anomalies.
+  The plan only mentions evaluating and saving models in detect_anomalies.py.
+  Why it matters: It's a stated deliverable. A one-line addition to the plan
+  covers it.
+
+  Neither changes the order of the stages, so we can go ahead.
+
+  Problem Understanding, Step 1: real-time anomaly detection for a DIY smart 
+  home
+
+  What makes this setting different from generic anomaly detection:
+
+  1. No real labels. A homeowner never labels anomalies, so the detector has to
+     be unsupervised or rule-based. The labels we inject are only for measuring
+     how well it works.
+  2. Real-time means causal. Each decision can only use past and current
+     readings. This rules out centered smoothing and any look-ahead.
+  3. False alarms cost a lot. A DIY user who gets several bogus alerts a day
+     turns the system off. Precision matters as much as recall.
+  4. Alerts must be explainable. "Fridge drew 0 W for 90 min" is something a
+     user can act on. "Anomaly score 0.71" is not.
+  5. Cheap hardware. It probably runs on a Raspberry Pi or Home Assistant box,
+     so a small model is better.
+  6. Context sets normal. The same reading can be fine or alarming depending on
+     time of day, day of week, or other sensors. That's the core of the
+     event-vs-anomaly question in Step 2.
+
+  Questions:
+  1. Do you agree that false alarms should count as the main cost, more than
+     missed events, when we define success later?
+  2. Should we assume detection runs on the device in the home, or is a cloud
+     service also acceptable? This only affects how much complexity we can
+     justify.
+
+  Once you confirm, I'll move to Step 2: event vs. anomaly.
+
+✻ Worked for 15s · done Friday 11:59 AM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, working through Problem Understanding step by step. Next, answer the two Step 1 questions (are false alarms the main cost, and does detection run on-device or in the cloud) so we can move to event vs. anomaly. (disable recaps in /config)
+
+❯ I have added the ai_transcripts udner the plan. Remind me to export as we     
+  complete each phase before we move on to next phase. Detection Part can be    
+  handles later when planning the repo stage. Moving to Stage 1, 1. for a       
+  success, flase alarms are just as costly as missed events. So lets decide on  
+  this when we are in the evaluation stage. 2. Lets keep it on device for now   
+  and focus on the cloud in the productionize part of  readme where we can it   
+  use retraining and updates.                                                   
+
+  Wrote 3 memories (ctrl+o to expand)
+
+● I'll remind you to export at the end of each phase. Noted for Step 1:
+  - Cost: false alarms and missed events count equally. We'll pin down how to
+    measure that in the evaluation stage.
+  - Deployment: detection runs on the device in the home. Cloud retraining and
+    updates go in the README's productionize section.
+
+  I'll add these to design.md when Stage 1 is complete.
+
+  Step 2: event vs. anomaly
+
+  - Event: a normal, expected thing happening, such as the door opening, motion,
+    or the fridge compressor starting. Most sensor activity is events.
+  - Anomaly: an observation that is unlikely given its context: time of day, day
+    of week, recent history, or other sensors.
+
+  The same reading can be either:
+
+  ┌─────────────────┬──────────────────────────┬───────────────────────────┐
+  │     Reading     │       Event when…        │       Anomaly when…       │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Front door      │ 08:15 on a weekday,      │ 03:10 with no motion      │
+  │ opens           │ leaving for work         │ before it                 │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Hallway motion  │ 19:00, people are home   │ 14:00 on a weekday, house │
+  │                 │                          │  empty, no door entry     │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │                 │ Off phase between        │                           │
+  │ Fridge at 0 W   │ compressor cycles (~20   │ Stays at 0 W for 3 hours  │
+  │                 │ min)                     │                           │
+  ├─────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Temperature     │ Heating night setback at │ Keeps falling for hours   │
+  │ drops 1 °C      │  23:00                   │ while heating should be   │
+  │                 │                          │ on                        │
+  └─────────────────┴──────────────────────────┴───────────────────────────┘
+
+  So an anomaly isn't defined by its value alone. It depends on context (when it
+  happens), duration (how long it lasts) and consistency (whether other sensors
+  agree).
+
+  Benign rare events are a third group: unusual but not anomalous. Examples are
+  a late-night bathroom trip, guests at the weekend, or the fridge defrost
+  cycle. They aren't labelled as anomalies, but they are what most often
+  triggers false alarms.
+
+  Question: Should benign rare events be part of the dataset as unlabelled
+  distractors? I recommend yes, 1–2 kinds. You weighted false alarms equal to
+  missed events, and without distractors the false-alarm rate would look better
+  than it really is.
+
+✻ Sautéed for 20s · done Friday 12:21 PM
+
+※ recap: We're building an anomaly-detection proof of concept for a smart home and are on Stage 1, Step 2: telling normal events apart from anomalies. Next, you decide whether to add 1–2 kinds of unlabelled benign rare events as distractors. (disable recaps in /config)
+
+❯ we can one or two kinds in that dataset to make it look more realistic..lets  
+  move to the next step                                                         
+
+● Noted: the dataset will include 1–2 kinds of benign rare events as unlabelled
+  distractors. We'll pick which ones in Step 4.
+
+  Step 3: sensor types and how they behave normally
+
+  Sensor: Indoor temperature
+  Data type: Continuous, slow-moving
+  Normal behaviour (real-world example): 19–23 °C. Heating schedule drives the
+  daily cycle: warm-up around 06:30, night setback around 23:00. Small rise
+  from afternoon sun. Noise of about ±0.1 °C.
+  ────────────────────────────────────────
+  Sensor: Fridge power
+  Data type: Continuous, cyclic
+  Normal behaviour (real-world example): Compressor runs at about 80–150 W for
+  10–20 min, then idles at about 1–5 W. Duty cycle 30–50%. Defrost heater spike
+   every 8–12 h. Short bumps after the fridge door is opened.
+  ────────────────────────────────────────
+  Sensor: Hallway motion
+  Data type: Binary (0/1 per minute)
+  Normal behaviour (real-world example): Follows occupancy: morning and evening
+  peaks, quiet while away on weekdays, sparse at night.
+  ────────────────────────────────────────
+  Sensor: Front door
+  Data type: Binary (0 = closed, 1 = open)
+  Normal behaviour (real-world example): Closed almost all the time. Opens for
+  1–3 min when people leave or return.
+
+  Why this matters
+  - Continuous sensors can be judged on their value and rate of change.
+  - Binary sensors can only be judged by when and how long they're active, and
+    whether that matches the other sensors.
+  - So one detection approach probably won't suit all four sensors. I'll note
+    that now and come back to it in the model stage.
+
+  Questions:
+  1. Household profile. I suggest one or two working adults: away on weekdays
+     around 08:30–17:30 with some daily variation, mostly home at weekends.
+     Working from home would make "house empty" anomalies much harder to define.
+     Does the first profile work for you?
+  2. Season. I suggest winter heating season with no daylight-saving change in
+     the 28 days. Heating gives temperature a clear daily cycle, and avoiding
+     the clock change avoids timestamp complications. Agree?
+
+✻ Brewed for 8s · done Friday 2:25 PM
+
+❯ Household profile: We will go with two adults with one having aa hybrid       
+  option of 3 days at aoofice and 2 days at house. 2. Suggeested should be      
+  fine.                                                                         
+
+● Noted: winter heating season, no daylight-saving change.
+
+  A risk with the hybrid profile (medium priority): on the 2 work-from-home days
+  someone is home all day, so daytime hallway motion is normal on those days.
+  That makes "motion while the house is empty" valid on only 3 weekdays. Whether
+  a detector can learn this depends on how the work-from-home days are chosen:
+
+  ┌───────────────┬─────────────────────────────────────────────────────────┐
+  │    Option     │                         Effect                          │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ Fixed days    │ Shows up as a weekly pattern. But training covers only  │
+  │ (e.g. Mon and │ 2 weeks, so each weekday appears just twice, which is   │
+  │  Fri at home) │ weak but learnable.                                     │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │               │ Realistic, but no detector can tell whether the house   │
+  │ Random days   │ is meant to be empty. Daytime-intrusion anomalies would │
+  │ each week     │  turn into guesswork, and we'd get either false alarms  │
+  │               │ or missed events.                                       │
+  └───────────────┴─────────────────────────────────────────────────────────┘
+
+  My recommendation is fixed days, Mon and Fri at home. It keeps the profile
+  realistic and the intrusion anomaly well defined.
+
+  Question: Fixed Mon/Fri work-from-home days, or do you want random days and
+  accept that daytime intrusion will be hard to detect?
+
+  Once that's settled, Step 4 (choosing which events and anomalies to inject) is
+  the last step of Problem Understanding.
+
+✻ Worked for 9s · done Friday 2:33 PM
+
+❯ lets keep it fixedd mon/fri for this task..                                   
+
+● Fixed: work from home on Mon and Fri; office on Tue, Wed and Thu.
+
+  Step 4: what to inject
+
+  Proposed anomalies (7 types, at least one per sensor, covering every anomaly
+  category):
+
+  ┌─────┬─────────────────────┬──────────┬────────────────┬────────────────┐
+  │  #  │       Anomaly       │  Sensor  │    Category    │  Real-world    │
+  │     │                     │          │                │    meaning     │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 1   │ Temperature spike   │ temp     │ point          │ Sensor glitch  │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Heating failure     │          │                │                │
+  │ 2   │ (slow drift down    │ temp     │ collective     │ Boiler fault   │
+  │     │ over hours)         │          │                │                │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 3   │ Power drops to ~0 W │ fridge   │ collective     │ Fridge failure │
+  │     │  for hours          │          │                │  or unplugged  │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Compressor never    │          │                │ Door ajar or   │
+  │ 4   │ stops               │ fridge   │ collective     │ refrigerant    │
+  │     │                     │          │                │ leak           │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │     │ Daytime motion on   │ motion   │ contextual /   │                │
+  │ 5   │ an office day, no   │ (+door)  │ cross-sensor   │ Intrusion      │
+  │     │ door entry first    │          │                │                │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 6   │ Door opened at      │ door     │ contextual     │ Security       │
+  │     │ night               │          │                │ breach         │
+  ├─────┼─────────────────────┼──────────┼────────────────┼────────────────┤
+  │ 7   │ Door left open for  │ door     │ collective     │ Forgot to      │
+  │     │ a long time         │          │                │ close it       │
+  └─────┴─────────────────────┴──────────┴────────────────┴────────────────┘
+
+  Timing, magnitude and duration will be randomised per event. We'll settle the
+  exact ranges and counts in the dataset stage.
+
+  Proposed benign rare events (unlabelled distractors):
+  - Night bathroom trip: a brief hallway motion at around 02:00–04:00, with no
+    door activity.
+  - Weekend guests: extra door openings and motion late on a Saturday evening.
+
+  Questions:
+  1. Is this list right, or would you add or drop anything? Seven is a
+     reasonable size for the time budget. If we need to trim, #4 is the first to
+     drop.
+  2. Missing data and outages. Your scope mentions missing observations. Should
+     a sensor going offline be a data-quality issue (handled in cleaning and
+     reported separately) or an anomaly we detect and score? I recommend
+     treating it as a data-quality issue so it doesn't skew the anomaly metrics.
+
+✻ Churned for 11s · done Friday 2:45 PM
+
+※ recap: We're finishing Stage 1 (Problem Understanding) of your smart-home anomaly detection take-home by settling which events and anomalies to inject. Next, approve the 7-anomaly list and decide whether sensor outages count as anomalies or data-quality issues.
+
+❯ lets go with 7...1.Let add 1-2 anomalies per type in validationa and test     
+  set. Training gete atleast teo per type, unlabelled for the models. 2.Its an  
+  data qulaity issue, handles while cleaning.                                   
+
+● Write(docs\design.md)
+  ⎿  Wrote 57 lines to docs\design.md
+       1 # Design Decisions
+       3 ## Stage 1 – Problem Understanding
+       4 
+       6 - Real-time anomaly detection for a single DIY smart home, runni
+       7 - Cloud retraining and model updates are covered only in the REA
+         DME's productionization section.
+         rule-based. Injected labels are used only for evaluation.
+       9 - Real-time means **causal**: each decision uses only past and c
+      10 - False alarms and missed events are treated as **equally costly
+         tage.
+     … +78 lines (ctrl+o to expand)
+
+● I've written the Stage 1 decisions into docs/design.md.
+
+  One risk to flag (medium priority): with only 1 event of a type in a split,
+  detection rate for that type can only be 0% or 100%. We can fix exact counts
+  in the dataset stage. I'd lean towards 2 per type in validation and test,
+  which is 14 events each.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Once you've reviewed design.md and approved Stage 1, we'll move on to the repo
+  structure.
+
+✻ Sautéed for 22s · done Friday 3:03 PM
+
+❯ then 2 per type then in val/test so the recal per type isnt 0 or 100...lets   
+  add atleast 3 per type in training dataset...lets keep the anomaly rate       
+  small. We will have to check % of anomaly minutes after data generation.If    
+  its high we might have to shorten their durations.                            
+
+● Update(docs\design.md)
+  ⎿  Added 3 lines, removed 2 lines
+      45  
+      46  - Timing, magnitude and duration are randomised per event. Exac
+          t ranges are set in the dataset stage.
+      47  - **Counts:**
+      48 -  - Train: at least 2 per type. Present in the data, but labels
+         - are never used as model input (realistic contamination).      
+      49 -  - Validation and test: 1–2 per type.                         
+      48 +  - Train: at least 3 per type (≥21 events). Present in the dat
+         +a, but labels are never used as model input (realistic contamin
+         +ation).                                                        
+      49 +  - Validation and test: exactly 2 per type (14 events each), s
+         +o per-type recall is not limited to 0% or 100%.                
+      50 +- **Keep the anomaly rate small.** Check the % of anomalous min
+         +utes (overall and per sensor) after generation. If it is too hi
+         +gh, shorten the long-duration anomalies.                       
+      51  
+      52  ### Benign rare events (unlabelled distractors)
+      53  - **Night bathroom trip:** brief hallway motion around 02:00–04
+          :00, no door activity.
+
+● I've updated design.md: training gets at least 3 per type, validation and test
+  get exactly 2 per type, and we check the % of anomalous minutes after
+  generation.
+
+  Two things to know:
+  - Low priority: with 2 events per type, per-type recall can still only be 0%,
+    50% or 100%. That's fine for a proof of concept, but we should say so in the
+    README.
+  - Medium priority: you're right to check the anomaly rate. A rough estimate
+    using durations at the middle of the ranges discussed so far (not real data
+    yet): in training, the long anomalies (heating failure, fridge power loss,
+    compressor never stops) could make up around 5–6% of the temperature and 
+    fridge minutes. That's probably the upper end of "small". We'll measure it
+    properly after generation and shorten durations if needed.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Is Stage 1 approved?
+
+✻ Cooked for 10s · done Friday 3:31 PM
+❯ Some udpates 1.note down all the things that have to be added in readme  in   
+  the design documnet as a last section so we can carry over later... 2. Make   
+  events and anomlaies term seperate in the deign doc.                          
+
+● Update(docs\design.md)
+  ⎿  Added 9 lines, removed 5 lines
+      10  - False alarms and missed events are treated as **equally costl
+          y**. The exact success metric will be defined in the evaluation
+           stage.
+      11  - Alerts must be explainable to a non-expert user.
+      12  
+      13 -### Event vs. anomaly                                          
+      14 -- **Event:** a normal, expected occurrence (door opens, motion,
+         - compressor cycle).                                            
+      15 -- **Anomaly:** an observation that is unlikely given its contex
+         -t: time of day, day of week, duration, or consistency with othe
+         -r sensors.                                                     
+      16 -- The same reading can be either (e.g. door opening at 08:15 vs
+         -. 03:10). Value thresholds alone are not enough.               
+      17 -- **Benign rare events:** unusual but normal. They stay unlabel
+         -led and test the false-alarm rate.                             
+      13 +### Terminology                                                
+      14 +This document keeps the two terms strictly separate:           
+      15  
+      16 +- **Event:** normal activity. It is never labelled and never co
+         +unted as a detection target.                                   
+      17 +  - **Routine events:** everyday activity (door opens when leav
+         +ing, evening motion, compressor cycle, defrost).               
+      18 +  - **Benign rare events:** unusual but normal activity (night 
+         +bathroom trip, weekend guests). They test the false-alarm rate.
+      19 +- **Anomaly:** an observation that is unlikely given its contex
+         +t (time of day, day of week, duration, or consistency with othe
+         +r sensors). Anomalies are injected, labelled, and are the detec
+         +tion targets.                                                  
+      20 +                                                               
+      21 +The same reading can be an event or an anomaly depending on con
+         +text (e.g. door opening at 08:15 vs. 03:10), so value threshold
+         +s alone are not enough.                                        
+      22 +                                                               
+      23  ### Sensors
+      24  
+      25  | Sensor | Data type | Normal behaviour |
+
+● Update(docs\design.md)
+  ⎿  Added 2 lines, removed 2 lines
+      49  
+      50  - Timing, magnitude and duration are randomised per event. Exac
+          t ranges are set in the dataset stage.
+      51  - **Counts:**
+      52 -  - Train: at least 3 per type (≥21 events). Present in the dat
+         -a, but labels are never used as model input (realistic contamin
+         -ation).                                                        
+      53 -  - Validation and test: exactly 2 per type (14 events each), s
+         -o per-type recall is not limited to 0% or 100%.                
+      52 +  - Train: at least 3 per type (≥21 anomalies). Present in the 
+         +data, but labels are never used as model input (realistic conta
+         +mination).                                                     
+      53 +  - Validation and test: exactly 2 per type (14 anomalies each)
+         +, so per-type recall is not limited to 0% or 100%.             
+      54  - **Keep the anomaly rate small.** Check the % of anomalous min
+          utes (overall and per sensor) after generation. If it is too hi
+          gh, shorten the long-duration anomalies.
+      55  
+      56  ### Benign rare events (unlabelled distractors)
+
+● Update(docs\design.md)
+  ⎿  Added 16 lines, removed 2 lines
+      53    - Validation and test: exactly 2 per type (14 anomalies each)
+          , so per-type recall is not limited to 0% or 100%.
+      54  - **Keep the anomaly rate small.** Check the % of anomalous min
+          utes (overall and per sensor) after generation. If it is too hi
+          gh, shorten the long-duration anomalies.
+      55  
+      56 -### Benign rare events (unlabelled distractors)                
+      56 +### Injected benign rare events (unlabelled distractors)       
+      57  - **Night bathroom trip:** brief hallway motion around 02:00–04
+          :00, no door activity.
+      58  - **Weekend guests:** extra door openings and motion on a Satur
+          day evening.
+      59  
+      60  ### Data quality
+      61 -- Sensor outages and missing observations are a **data-quality 
+         -issue**, not an anomaly.                                       
+      61 +- Sensor outages and missing observations are a **data-quality 
+         +issue**, neither an event nor an anomaly.                      
+      62  - They are handled during cleaning and reported separately, and
+           excluded from anomaly metrics.
+      63 +                                                               
+      64 +---                                                            
+      65 +                                                               
+      66 +## README Carry-Over                                           
+      67 +Items to include in README.md when it is written at the end:   
+      68 +                                                               
+      69 +- **Overview:** on-device, causal, real-time detection for one 
+         +household. Labels are used only for evaluation.                
+      70 +- **Terminology:** events (routine + benign rare) vs. anomalies
+         +.                                                              
+      71 +- **Anomaly definitions:** the 7 injected anomaly types with th
+         +eir real-world meaning.                                        
+      72 +- **Assumptions:** household profile (two adults, hybrid WFH Mo
+         +n/Fri, house empty Tue–Thu daytime), winter heating season, no 
+         +daylight-saving change.                                        
+      73 +- **Data quality:** outages and missing data are handled in cle
+         +aning, not scored as anomalies.                                
+      74 +- **Limitations:** with 2 anomalies per type in validation/test
+         +, per-type recall can only be 0%, 50% or 100%. Training contain
+         +s unlabelled anomalies (contamination).                        
+      75 +- **Productionization:** on-device serving. Cloud is used for r
+         +etraining and model updates. Monitoring and retraining strategy
+         + still to be written.                                          
+      76 +- **AI transcripts:** exported per phase into `ai_transcripts/`
+         +.                                                              
+
+  Ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● I've updated docs/design.md with both changes:
+
+  1. Event and anomaly are now separate terms. A new Terminology section defines
+     them:
+     - Event: normal activity, never labelled. It has two subtypes: routine
+       events and benign rare events.
+     - Anomaly: an injected, labelled detection target.
+
+     I also fixed places where the doc called anomalies "events" (it now says
+     "14 anomalies" per split, not "14 events").
+  2. New last section, "README Carry-Over". It lists what we've decided so far
+     that belongs in the README: overview, terminology, anomaly definitions,
+     assumptions, data quality, limitations, productionization notes and the AI
+     transcripts. I'll add to it at the end of each stage.
+
+  Before Stage 2: please export this session's transcript (/export) into
+  ai_transcripts/.
+
+  Is Stage 1 approved?
+
+✻ Crunched for 28s · done Friday 3:42 PM
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: C:\Users\Gracy\Projects\Anomaly
+     Detection\docs\001_problem_understanding.txt
+
+❯ lets move on to next stage                                                    
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Stage 1 is approved. The transcript is in
+  ai_transcripts/001_problem_understanding.txt.
+
+  Stage 2: repo structure
+
+  Issues to fix in the planned file list:
+
+  Priority: High
+  Issue: The task requires the detection script to output the detected 
+  anomalies.
+  Right now detect_anomalies.py only evaluates and saves models.
+  Proposal: detect_anomalies.py also writes an alerts CSV (timestamp, sensor,
+  anomaly score/rule, reason).
+  ────────────────────────────────────────
+  Priority: Medium
+  Issue: Cleaning and features get decided in analysis.ipynb, but
+  detect_anomalies.py and inference.py must apply the same steps. They can't
+  import from a notebook, and copying the code risks training and production
+  drifting apart.
+  Proposal: One shared module, features.py, holding cleaning and feature
+  functions. The notebook explains the choices; the module implements them.
+  ────────────────────────────────────────
+  Priority: Low
+  Issue: Parameters and seeds would be scattered across scripts.
+  Proposal: One config.py for sensors, split dates, seeds and paths.
+
+  Proposed layout:
+  ├── README.md
+  ├── requirements.txt
+  ├── config.py             # sensors, split dates, seeds, paths
+  ├── generate_data.py      # synthetic data + labels → data/
+  ├── features.py           # shared cleaning + causal features
+  ├── analysis.ipynb        # cleaning decisions, EDA plots
+  ├── detect_anomalies.py   # train/compare models on train+val, save best, 
+  write alerts
+  ├── inference.py          # stream test days line by line with saved model
+  ├── data/                 # sensors CSV, labels CSV (kept separate)
+  ├── artifacts/            # saved model, thresholds, preprocessing config
+  ├── outputs/              # alerts CSVs, metrics
+  ├── docs/                 # plan, task, design
+  └── ai_transcripts/
+
+  Questions:
+  1. Are you happy to add features.py and config.py to the planned files?
+  2. Should the generated data go into git? The data is small (40,320 rows of 4
+     sensors, a few MB). I recommend committing it, so a reviewer can run the
+     analysis without regenerating, and because it shows exactly which data the
+     results came from.
+
+✻ Worked for 14s · done Friday 3:45 PM
+
+❯ 1. Yes add noth files 2. Yes, commit the data, with labels kept in a seperate 
+  file and make the generator reproducible from config.py seed..Update this     
+  layout in design.md and move on.                                              
+
+● Update(docs\design.md)
+  ⎿  Added 26 lines
+      63  
+      64  ---
+      65  
+      66 +## Stage 2 – Repo Structure                                    
+      67 +                                                               
+      68 +```                                                            
+      69 +├── README.md                                                  
+      70 +├── requirements.txt                                           
+      71 +├── config.py             # sensors, split dates, seeds, paths 
+      72 +├── generate_data.py      # synthetic data + labels → data/    
+      73 +├── features.py           # shared cleaning + causal features  
+      74 +├── analysis.ipynb        # cleaning decisions, EDA plots      
+      75 +├── detect_anomalies.py   # train/compare models on train+val, 
+         +save best, write alerts                                        
+      76 +├── inference.py          # stream test days line by line with 
+         +saved model                                                    
+      77 +├── data/                 # sensor readings CSV and labels CSV 
+         +(separate files)                                               
+      78 +├── artifacts/            # saved model, thresholds, preprocess
+         +ing config                                                     
+      79 +├── outputs/              # alerts CSVs, metrics               
+      80 +├── docs/                 # plan, task, design                 
+      81 +└── ai_transcripts/       # exported AI session transcripts, on
+         +e per phase                                                    
+      82 +```                                                            
+      83 +                                                               
+      84 +### Decisions                                                  
+      85 +- **`features.py`:** single source of cleaning and feature logi
+         +c, shared by `detect_anomalies.py` and `inference.py`, so train
+         +ing and production cannot drift apart. `analysis.ipynb` justifi
+         +es the choices but does not hold production code.              
+      86 +- **`config.py`:** single place for sensors, split dates, rando
+         +m seed and paths.                                              
+      87 +- **`detect_anomalies.py`:** writes an alerts CSV (timestamp, s
+         +ensor, score/rule, reason), as the task requires, in addition t
+         +o comparing and saving models.                                 
+      88 +- **Generated data is committed to git.** Sensor readings and l
+         +abels are kept in separate files. The generator is fully reprod
+         +ucible from the seed in `config.py`.                           
+      89 +                                                               
+      90 +---                                                            
+      91 +                                                               
+      92  ## README Carry-Over
+      93  Items to include in README.md when it is written at the end:
+      94  
+
+● Update(docs\design.md)
+  ⎿  Added 2 lines
+      100  - **Limitations:** with 2 anomalies per type in validation/tes
+           t, per-type recall can only be 0%, 50% or 100%. Training conta
+           ins unlabelled anomalies (contamination).
+      101  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      102  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+      103 +- **Repo layout:** the tree and a one-line role for each file 
+          +(Stage 2).                                                    
+      104 +- **Setup & run:** `pip install -r requirements.txt`, then the
+          + run order `generate_data.py` → `analysis.ipynb` → `detect_ano
+          +malies.py` → `inference.py`. Note that the committed data is r
+          +eproducible from the seed in `config.py`.                     
+
+● I've added the Stage 2 layout and decisions to docs/design.md:
+  - features.py and config.py are added to the file list.
+  - The data is committed, with readings and labels in separate files.
+  - The generator is reproducible from the seed in config.py.
+
+  The README Carry-Over section now also includes the repo layout and the
+  setup/run order.
+
+  Before Stage 3: please export this session's transcript (/export) into
+  ai_transcripts/. Then say go and we'll start Stage 3: dataset design, creation
+  and split.
+
+✻ Cogitated for 15s · done Friday 3:48 PM
+
+❯ lets move to the next stage and start dataset generation....confirm the       
+  details with me in topics at a time. Also when writing the code, I wnat clear 
+  sections with headers  and short commnets. Use modular funstions so i can     
+  review each block.                                                            
+
+  Ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● Got it. For the code I'll use clear section headers, short comments and small
+  modular functions, and confirm one topic at a time before writing any of it.
+
+  Stage 3: dataset design
+
+  We'll go through it in this order:
+  1. Format and identifiers
+  2. Normal sensor behaviour
+  3. Anomaly injection
+  4. Benign events
+  5. Missing data and outages
+  6. Split
+
+  Then I'll write the code.
+
+  Topic 1: format and identifiers
+
+  Sensor IDs: temp_living_room, power_fridge, motion_hallway, door_front
+
+  Readings file: data/sensor_readings.csv. I suggest a wide format, with one row
+  per minute and one column per sensor:
+  timestamp, temp_living_room, power_fridge, motion_hallway, door_front
+  2024-01-08 00:00, 20.1, 3.2, 0, 0
+  - It makes streaming line by line straightforward: each row is a full snapshot
+    of the home.
+  - A missing reading is simply an empty cell (NaN).
+  - The alternative is a long format (timestamp, sensor_id, value). It's closer
+    to how raw IoT messages arrive, but every model would have to pivot it back
+    to wide.
+
+  Label and log files (kept separate from the readings):
+  - data/anomaly_labels.csv has one row per injected anomaly: anomaly_id, 
+    anomaly_type, sensor_id, start, end, magnitude, split. Per-minute labels can
+    be derived from this table.
+  - data/generation_log.csv records the benign events and outages: kind, 
+    sensor_id, start, end. It is never used for scoring. It's only there to
+    check later whether false alarms landed on benign events and whether
+    cleaning caught every outage.
+
+  Dates: Mon 2024-01-08 to Sun 2024-02-04, in local time with no time zone.
+  That's winter with no daylight-saving change. Starting on a Monday means each
+  split is made of whole Mon–Sun weeks.
+
+  Questions:
+  1. Wide format: OK?
+  2. Two separate files (anomaly labels, generation log): OK?
+  3. Dates: OK?
+
+✻ Cooked for 21s · done Friday 3:55 PM
+
+※ recap: We're building a smart-home anomaly detection proof of concept and are now on Stage 3, dataset design, topic 1 of 6: format and identifiers. Next, please confirm the wide CSV format, the two separate label files, and the dates 2024-01-08 to 2024-02-04.
+
+❯ yes to all three, changes: 1. add a magnitude_unit column since it can meaan  
+  many things. next topic                                                       
+
+● Update(docs\design.md)
+  ⎿  Added 11 lines
+       89  
+       90  ---
+       91  
+       92 +## Stage 3 – Dataset Design, Creation and Split               
+       93 +                                                              
+       94 +### Format and identifiers                                    
+       95 +- **Sensor IDs:** `temp_living_room`, `power_fridge`, `motion_
+          +hallway`, `door_front`.                                       
+       96 +- **Dates:** Mon 2024-01-08 to Sun 2024-02-04, 1-minute sampli
+          +ng, local time with no time zone (winter, no daylight-saving c
+          +hange). Splits align with whole Mon–Sun weeks.                
+       97 +- **`data/sensor_readings.csv`:** wide format, one row per min
+          +ute: `timestamp, temp_living_room, power_fridge, motion_hallwa
+          +y, door_front`. Missing readings are NaN. Chosen because line-
+          +by-line streaming gets a full home snapshot per row.          
+       98 +- **`data/anomaly_labels.csv`:** one row per injected anomaly:
+          + `anomaly_id, anomaly_type, sensor_id, start, end, magnitude, 
+          +magnitude_unit, split`. Per-minute labels are derived from thi
+          +s table. `magnitude_unit` is needed because magnitude means di
+          +fferent things per type (°C, W, minutes, …).                  
+       99 +- **`data/generation_log.csv`:** benign events and outages: `k
+          +ind, sensor_id, start, end`. Never used for scoring. It is onl
+          +y for diagnosing false alarms and verifying cleaning.         
+      100 +                                                              
+      101 +---                                                           
+      102 +                                                              
+      103  ## README Carry-Over
+      104  Items to include in README.md when it is written at the end:
+      105  
+
+● I've added a magnitude_unit column and recorded Topic 1 in design.md.
+
+  Topic 2: normal sensor behaviour
+
+  Who is home (drives all four sensors):
+  - Everyone wakes around 06:30 and sleeps around 23:00, varying by about ±30
+    min each day.
+  - Tue–Thu: both adults leave around 08:00–08:45 and return around 17:00–18:30,
+    so the house is empty in between.
+  - Mon and Fri: one adult leaves and one stays home.
+  - Weekends: home, with one random 2–4 h outing per day.
+
+  Indoor temperature
+  - The thermostat targets 21 °C while people are awake and 18 °C at night.
+  - Room temperature follows the target with a lag (it takes roughly 30–60 min
+    to reach it) and isn't fixed exactly at it.
+  - It gains about 0.5 °C in the afternoon from the sun, and has sensor noise of
+    about 0.1 °C.
+
+  Fridge power
+  - The compressor runs at 100–130 W for 12–18 min, then idles at 2–5 W for 
+    18–30 min, so it's on about 40% of the time.
+  - A defrost runs every ~10 h for about 20 min at roughly 300 W. This is
+    normal, but it is the largest power reading in the data.
+  - Run periods are about 20% longer at mealtimes when someone is home, because
+    the fridge door is being opened.
+
+  Hallway motion
+  - The chance of motion in a given minute depends on the household's state:
+    - Awake and home: about 0.10–0.30, highest in the morning and evening.
+    - Asleep: about 0.005.
+    - Away: 0.
+  - There is always motion just before the front door opens and just after it
+    closes, as people walk through the hallway.
+
+  Front door
+  - It opens for 1–3 min each time someone leaves or comes home.
+  - On days someone is home, it also opens 0–2 extra times (deliveries, taking
+    out the bin).
+
+  Questions:
+  1. Eco mode while away. Should the thermostat drop to about 18 °C while the
+     house is empty on Tue–Thu? I recommend yes. It's realistic for a smart
+     thermostat, and it gives temperature a weekly pattern as well as a daily
+     one. The downside is that a heating failure during those hours becomes
+     harder to spot.
+  2. Weekend outings. These create door and motion activity and short empty
+     periods at weekends. Keep them, or keep weekends simpler?
+
+✻ Brewed for 26s · done Friday 4:14 PM
+
+❯ yes but with two changes, 1. eco mode and inject failure whne the target is   
+  21 °C....and keep weekends simple bu making one adult stay in at all times    
+
+● Update(docs\design.md)
+  ⎿  Added 22 lines
+       98  - **`data/anomaly_labels.csv`:** one row per injected anomaly:
+            `anomaly_id, anomaly_type, sensor_id, start, end, magnitude, 
+           magnitude_unit, split`. Per-minute labels are derived from thi
+           s table. `magnitude_unit` is needed because magnitude means di
+           fferent things per type (°C, W, minutes, …).
+       99  - **`data/generation_log.csv`:** benign events and outages: `k
+           ind, sensor_id, start, end`. Never used for scoring. It is onl
+           y for diagnosing false alarms and verifying cleaning.
+      100  
+      101 +### Normal behaviour                                          
+      102 +- **Occupancy (drives all sensors):**                         
+      103 +  - Wake ~06:30, sleep ~23:00 (±30 min daily jitter).         
+      104 +  - **Tue–Thu:** both adults out ~08:00–08:45 → ~17:00–18:30, 
+          +so the house is empty in between.                             
+      105 +  - **Mon/Fri:** one adult stays home.                        
+      106 +  - **Weekends:** one adult always stays home. The other has o
+          +ne 2–4 h outing per day. The house is never empty at weekends.
+      107 +  - So "house empty" only occurs on Tue–Thu daytime.          
+      108 +- **Indoor temperature:**                                     
+      109 +  - Thermostat targets 21 °C while awake and home, 18 °C at ni
+          +ght, and 18 °C eco mode while the house is empty (Tue–Thu dayt
+          +ime).                                                         
+      110 +  - Room temperature follows the target with a first-order lag
+          + (~30–60 min).                                                
+      111 +  - Afternoon solar gain of ~+0.5 °C, sensor noise ~0.1 °C.   
+      112 +- **Fridge power:**                                           
+      113 +  - Compressor 100–130 W for 12–18 min, idle 2–5 W for 18–30 m
+          +in (~40% duty).                                               
+      114 +  - Defrost every ~10 h, ~20 min at ~300 W (normal, but the hi
+          +ghest reading).                                               
+      115 +  - Runs ~20% longer at mealtimes when someone is home.       
+      116 +- **Hallway motion:**                                         
+      117 +  - Per-minute probability: ~0.10–0.30 awake and home (morning
+          +/evening peaks), ~0.005 asleep, 0 when away.                  
+      118 +  - Always motion just before the door opens and just after it
+          + closes.                                                      
+      119 +- **Front door:**                                             
+      120 +  - Opens 1–3 min at each departure or arrival.               
+      121 +  - 0–2 extra openings per day when someone is home.          
+      122 +                                                              
+      123  ---
+      124  
+      125  ## README Carry-Over
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      128  - **Overview:** on-device, causal, real-time detection for one
+            household. Labels are used only for evaluation.
+      129  - **Terminology:** events (routine + benign rare) vs. anomalie
+           s.
+      130  - **Anomaly definitions:** the 7 injected anomaly types with t
+           heir real-world meaning.
+      131 -- **Assumptions:** household profile (two adults, hybrid WFH M
+          -on/Fri, house empty Tue–Thu daytime), winter heating season, n
+          -o daylight-saving change.                                     
+      131 +- **Assumptions:** household profile (two adults, hybrid WFH M
+          +on/Fri, house empty only Tue–Thu daytime, one adult always hom
+          +e at weekends), thermostat with night setback and eco mode, wi
+          +nter heating season, no daylight-saving change.               
+      132  - **Data quality:** outages and missing data are handled in cl
+           eaning, not scored as anomalies.
+      133  - **Limitations:** with 2 anomalies per type in validation/tes
+           t, per-type recall can only be 0%, 50% or 100%. Training conta
+           ins unlabelled anomalies (contamination).
+      134  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+
+● I've recorded Topic 2 in design.md:
+  - Eco mode: on, at 18 °C while the house is empty.
+  - Weekends: one adult always stays home, so the house is only ever empty on
+    Tue–Thu daytime.
+
+  Topic 3: anomaly injection
+
+  Each anomaly gets a random start time within its allowed window, and a random
+  duration and magnitude drawn from the ranges below.
+
+  ┌─────────────────────┬──────────────────┬──────────┬─────────────────────┐
+  │        Type         │   When allowed   │ Duration │  Magnitude (unit)   │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │ temp_spike          │ Any time         │ 1–3 min  │ ±3–8 (°C jump,      │
+  │                     │                  │          │ random sign)        │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │                     │ Only when the    │          │ Temperature falls   │
+  │ heating_failure     │ thermostat       │ 2–5 h    │ 0.3–0.8 °C/h, then  │
+  │                     │ target is 21 °C  │          │ recovers normally   │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │ fridge_power_loss   │ Any time         │ 1–4 h    │ Power reads 0–0.5 W │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │                     │                  │          │ Constant 100–130 W  │
+  │ compressor_stuck_on │ Any time         │ 2–4 h    │ (W). A normal run   │
+  │                     │                  │          │ is at most 18 min.  │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │                     │ Tue–Thu while    │          │ Share of minutes    │
+  │ intrusion_motion    │ the house is     │ 5–30 min │ with motion:        │
+  │                     │ empty            │          │ 0.3–0.6. No door    │
+  │                     │                  │          │ opening.            │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │                     │                  │          │ Minutes open (min), │
+  │ door_open_night     │ 00:30–05:00      │ 1–5 min  │  with hallway       │
+  │                     │                  │          │ motion around it    │
+  ├─────────────────────┼──────────────────┼──────────┼─────────────────────┤
+  │                     │                  │ 30–90    │ Minutes open (min). │
+  │ door_left_open      │ Awake and home   │ min      │  A normal opening   │
+  │                     │                  │          │ is 1–3 min.         │
+  └─────────────────────┴──────────────────┴──────────┴─────────────────────┘
+
+  Placement rules:
+  - No two anomalies overlap. There is at least a 2 h gap between any two.
+  - Anomalies are never placed inside an outage.
+
+  Questions:
+  1. Do the ranges look plausible? I kept the long anomalies near the short end
+     so the share of anomalous minutes stays small.
+  2. Night door opening. Should hallway motion come with it, as an intruder
+     walking in would, or not? With motion, it differs from a night bathroom
+     trip (motion only) only by the door opening.
+
+✻ Churned for 27s · done Friday 4:24 PM
+※ recap: We're designing the synthetic smart-home dataset step by step, and we're on topic 3 of stage 3, the anomaly injection ranges. Next, confirm whether those ranges look plausible and whether a night door opening should come with hallway motion.
+
+❯ Keep them for now...let come back to this once we generate the minutes after  
+  the split...some changes, 1. for heating failure, the total drop must be      
+  atleast 1.5 °C anomalies must aviod benign events too as well as outages      
+
+● Update(docs\design.md)
+  ⎿  Added 18 lines
+      120    - Opens 1–3 min at each departure or arrival.
+      121    - 0–2 extra openings per day when someone is home.
+      122  
+      123 +### Anomaly injection                                         
+      124 +Random start within the allowed window, with random duration a
+          +nd magnitude per anomaly. Ranges are provisional and will be r
+          +evisited after generation, once the anomalous-minute rate is m
+          +easured.                                                      
+      125 +                                                              
+      126 +| Type | When allowed | Duration | Magnitude (unit) |         
+      127 +|---|---|---|---|                                             
+      128 +| `temp_spike` | Any time | 1–3 min | ±3–8 (°C jump, random si
+          +gn) |                                                         
+      129 +| `heating_failure` | Entire window inside a 21 °C target peri
+          +od | 2–5 h | Fall rate 0.3–0.8 °C/h, **total drop ≥ 1.5 °C**, 
+          +then normal recovery |                                        
+      130 +| `fridge_power_loss` | Any time | 1–4 h | Power reads 0–0.5 W
+          + |                                                            
+      131 +| `compressor_stuck_on` | Any time | 2–4 h | Constant 100–130 
+          +W (normal run ≤ 18 min) |                                     
+      132 +| `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+          + min | Share of minutes with motion 0.3–0.6, no door opening |
+      133 +| `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, wi
+          +th hallway motion around it |                                 
+      134 +| `door_left_open` | Awake and home | 30–90 min | Minutes open
+          + (normal 1–3 min) |                                           
+      135 +                                                              
+      136 +- **Heating failure ≥ 1.5 °C:** sample the fall rate first, th
+          +en the duration from [max(2 h, 1.5 / rate), 5 h]. At the lowes
+          +t rate this forces a 5 h failure.                             
+      137 +- **Placement:**                                              
+      138 +  - No overlap between anomalies, with a gap of at least 2 h. 
+      139 +  - Anomalies never overlap benign events or outages, so each 
+          +label stays unambiguous.                                      
+      140 +                                                              
+      141  ---
+      142  
+      143  ## README Carry-Over
+
+● I've recorded Topic 3 in design.md, including both changes:
+  - Heating failure, total drop of at least 1.5 °C. The generator picks the fall
+    rate first, then picks a duration long enough to reach 1.5 °C. At the
+    slowest rate (0.3 °C/h) that means the full 5 h. The whole failure must also
+    fall inside a period where the thermostat target is 21 °C. A 5 h window
+    fits easily on Mon/Fri and at weekends, but barely on Tue–Thu evenings.
+  - Anomalies avoid benign events and outages, so every label is unambiguous.
+
+  The night door opening keeps hallway motion, as proposed.
+
+  Topic 4: benign events (unlabelled)
+
+  Kind: night_bathroom_trip
+  When: 01:00–05:00
+  What happens: Motion for 1–4 min, no door opening
+  How often: About 3 per week
+  ────────────────────────────────────────
+  Kind: weekend_guests
+  When: Saturday 19:00–23:30
+  What happens: 3–6 extra door openings and higher motion (0.3–0.5) for 3–4 h
+  How often: Once per split, on one Saturday each in train, validation and test
+
+  - Night bathroom trips look like door_open_night without the door. They test
+    whether a detector reacts to night-time motion alone.
+  - Weekend guests look like door_left_open or intrusion (lots of door and
+    motion activity). They test whether a busy but normal evening triggers
+    alarms.
+
+  Question: Do these frequencies work? I don't want guests every Saturday: it
+  would become a routine weekly pattern rather than a rare event.
+
+✻ Worked for 20s · done Friday 4:53 PM
+
+※ recap: We're designing the synthetic smart-home dataset for your anomaly-detection take-home, working through Stage 3 one topic at a time. Next, confirm the benign-event frequencies: about 3 night bathroom trips per week, and weekend guests on one Saturday per split.
+
+❯ approved, go ahead                                                            
+
+● Update(docs\design.md)
+  ⎿  Added 11 lines
+      138    - No overlap between anomalies, with a gap of at least 2 h.
+      139    - Anomalies never overlap benign events or outages, so each 
+           label stays unambiguous.
+      140  
+      141 +### Benign events (unlabelled, logged in `generation_log.csv`)
+      142 +                                                              
+      143 +| Kind | When | What happens | How often |                    
+      144 +|---|---|---|---|                                             
+      145 +| `night_bathroom_trip` | 01:00–05:00 | Motion for 1–4 min, no
+          + door opening | ~3 per week |                                 
+      146 +| `weekend_guests` | Saturday 19:00–23:30 | 3–6 extra door ope
+          +nings, motion 0.3–0.5 for 3–4 h | Once per split (one Saturday
+          + each in train, val, test) |                                  
+      147 +                                                              
+      148 +- **Night bathroom trip:** the hard negative for `door_open_ni
+          +ght` (motion without the door).                               
+      149 +- **Weekend guests:** the hard negative for `door_left_open` a
+          +nd intrusion (a busy but normal evening).                     
+      150 +- Guests are not every Saturday, so they stay rare rather than
+          + becoming a weekly routine.                                   
+      151 +                                                              
+      152  ---
+      153  
+      154  ## README Carry-Over
+
+● I've recorded Topic 4 in design.md.
+
+  Topic 5: missing data and outages
+
+  These are data-quality problems, not anomalies. Each kind gives the cleaning
+  step something real to catch:
+
+  ┌─────────────────┬───────────────┬────────────────────┬──────────────────┐
+  │      Kind       │   What it     │ How it appears in  │      Amount      │
+  │                 │   simulates   │      the CSV       │                  │
+  ├─────────────────┼───────────────┼────────────────────┼──────────────────┤
+  │                 │ One sensor    │ That sensor's      │ 2–3 per sensor   │
+  │ sensor_outage   │ offline       │ column is NaN; the │ over 28 days,    │
+  │                 │ (battery,     │  rows are still    │ 10–120 min each  │
+  │                 │ Wi-Fi)        │ there              │                  │
+  ├─────────────────┼───────────────┼────────────────────┼──────────────────┤
+  │                 │               │ The rows are       │                  │
+  │ hub_outage      │ The whole hub │ missing entirely,  │ 1 occurrence,    │
+  │                 │  offline      │ leaving a gap in   │ 20–60 min        │
+  │                 │               │ timestamps         │                  │
+  ├─────────────────┼───────────────┼────────────────────┼──────────────────┤
+  │                 │ A single lost │                    │ ~0.1% of         │
+  │ dropped_reading │  message      │ One NaN cell       │ readings per     │
+  │                 │               │                    │ sensor           │
+  ├─────────────────┼───────────────┼────────────────────┼──────────────────┤
+  │                 │ The hub       │ The same timestamp │                  │
+  │ duplicate_row   │ re-sends a    │  appears twice     │ ~5 rows          │
+  │                 │ message       │                    │                  │
+  └─────────────────┴───────────────┴────────────────────┴──────────────────┘
+
+  - Outages are spread across all three splits, so the test-period stream also
+    has to cope with them.
+  - Everything except dropped readings is recorded in generation_log.csv, so we
+    can check later that cleaning caught all of it.
+
+  Questions:
+  1. Include hub_outage (missing rows)? I recommend yes. It's the only way to
+     test the timestamp-consistency check your plan lists under cleaning.
+  2. Include duplicate_row? I also recommend yes, for the same reason: the
+     plan's duplicate check needs something to find.
+
+✻ Cooked for 14s · done Friday 5:00 PM
+
+※ recap: We're designing the synthetic smart-home dataset for the anomaly detection take-home, and are on Topic 5, missing data and outages. Next, please confirm whether to include hub outages that drop whole rows, and duplicate rows.
+
+❯ yes to both, will the outage occuurence be at each split though               
+
+● No. As proposed, it isn't guaranteed:
+  - Hub outage: there's only 1, so only one split would get it.
+  - Sensor outages: 2–3 per sensor placed at random, so a split could end up
+    with none for some sensor.
+
+  That matters most for test. Streaming has to show it copes with outages, and
+  validation should have them too so that any outage handling is checked before
+  test.
+
+  Proposal: place them per split instead of at random over 28 days.
+
+  ┌─────────────────┬───────────────────────────┬───────┐
+  │      Kind       │         Per split         │ Total │
+  ├─────────────────┼───────────────────────────┼───────┤
+  │ sensor_outage   │ 1 per sensor (10–120 min) │ 12    │
+  ├─────────────────┼───────────────────────────┼───────┤
+  │ hub_outage      │ 1 (20–60 min)             │ 3     │
+  ├─────────────────┼───────────────────────────┼───────┤
+  │ duplicate_row   │ ~2                        │ ~6    │
+  ├─────────────────┼───────────────────────────┼───────┤
+  │ dropped_reading │ ~0.1% at random           │ –     │
+  └─────────────────┴───────────────────────────┴───────┘
+
+  Every split then has the same kinds of data-quality problems in about the same
+  amounts, which keeps train, validation and test comparable.
+
+  Question: Should I go with this per-split placement?
+
+✻ Crunched for 7s · done Friday 5:27 PM
+
+❯ yes go ahead                                                                  
+
+● Update(docs\design.md)
+  ⎿  Added 12 lines
+      149  - **Weekend guests:** the hard negative for `door_left_open` a
+           nd intrusion (a busy but normal evening).
+      150  - Guests are not every Saturday, so they stay rare rather than
+            becoming a weekly routine.
+      151  
+      152 +### Missing data and outages (data quality, not anomalies)    
+      153 +Placed **per split**, so train, val and test all contain the s
+          +ame kinds of data-quality issues and the test stream must hand
+          +le them.                                                      
+      154 +                                                              
+      155 +| Kind | Simulates | Appears in CSV as | Per split | Total |  
+      156 +|---|---|---|---|---|                                         
+      157 +| `sensor_outage` | One sensor offline | That column is NaN; r
+          +ows present | 1 per sensor, 10–120 min | 12 |                 
+      158 +| `hub_outage` | Whole hub offline | Rows missing (timestamp g
+          +ap) | 1, 20–60 min | 3 |                                      
+      159 +| `duplicate_row` | Hub re-sends a message | Same timestamp tw
+          +ice | ~2 | ~6 |                                               
+      160 +| `dropped_reading` | Single lost message | One NaN cell | ~0.
+          +1% random | – |                                               
+      161 +                                                              
+      162 +- Everything except `dropped_reading` is recorded in `generati
+          +on_log.csv` so cleaning can be verified.                      
+      163 +                                                              
+      164  ---
+      165  
+      166  ## README Carry-Over
+
+● I've recorded Topic 5 in design.md, with outages placed per split.
+
+  Topic 6: split
+
+  ┌────────────┬───────┬─────────────────┬──────────────────────────────────┐
+  │   Split    │ Days  │      Dates      │             Purpose              │
+  ├────────────┼───────┼─────────────────┼──────────────────────────────────┤
+  │ Train      │ 1–14  │ Mon Jan 8 – Sun │ Fitting models and thresholds    │
+  │            │       │  Jan 21         │ from normal behaviour            │
+  ├────────────┼───────┼─────────────────┼──────────────────────────────────┤
+  │ Validation │ 15–21 │ Mon Jan 22 –    │ Tuning thresholds and choosing   │
+  │            │       │ Sun Jan 28      │ the model                        │
+  ├────────────┼───────┼─────────────────┼──────────────────────────────────┤
+  │ Test       │ 22–28 │ Mon Jan 29 –    │ Run once, at the end             │
+  │            │       │ Sun Feb 4       │                                  │
+  └────────────┴───────┴─────────────────┴──────────────────────────────────┘
+
+  How it's produced:
+  - generate_data.py simulates one continuous 28-day series, then cuts it at the
+    split dates. Temperature and the fridge cycle then carry over smoothly
+    across the boundaries, which wouldn't happen if each split were generated
+    separately.
+  - No anomaly, benign event or outage crosses a split boundary. Each one sits
+    entirely within one split, which keeps the per-split counts exact.
+  - Output files:
+    - Readings: data/train.csv, data/val.csv, data/test.csv. A separate test
+      file is the natural input for line-by-line streaming later.
+    - Labels: one data/anomaly_labels.csv, with a split column.
+    - Generation log: one data/generation_log.csv.
+
+  Question: Three readings files, or one sensor_readings.csv with the split
+  boundaries defined only in config.py? I recommend three files. A file you
+  never open can't leak into tuning, which makes it harder to touch test data by
+  accident.
+
+✻ Cooked for 14s · done Friday 5:29 PM
+
+❯ three files, go ahead....when we do the cleaaning and eda...give me a summary 
+  of six topics before we move ahead                                            
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+       94  ### Format and identifiers
+       95  - **Sensor IDs:** `temp_living_room`, `power_fridge`, `motion_
+           hallway`, `door_front`.
+       96  - **Dates:** Mon 2024-01-08 to Sun 2024-02-04, 1-minute sampli
+           ng, local time with no time zone (winter, no daylight-saving c
+           hange). Splits align with whole Mon–Sun weeks.
+       97 -- **`data/sensor_readings.csv`:** wide format, one row per min
+          -ute: `timestamp, temp_living_room, power_fridge, motion_hallwa
+          -y, door_front`. Missing readings are NaN. Chosen because line-
+          -by-line streaming gets a full home snapshot per row.          
+       97 +- **`data/train.csv`, `data/val.csv`, `data/test.csv`:** wide 
+          +format, one row per minute: `timestamp, temp_living_room, powe
+          +r_fridge, motion_hallway, door_front`. Missing readings are Na
+          +N. Chosen because line-by-line streaming gets a full home snap
+          +shot per row.                                                 
+       98  - **`data/anomaly_labels.csv`:** one row per injected anomaly:
+            `anomaly_id, anomaly_type, sensor_id, start, end, magnitude, 
+           magnitude_unit, split`. Per-minute labels are derived from thi
+           s table. `magnitude_unit` is needed because magnitude means di
+           fferent things per type (°C, W, minutes, …).
+       99  - **`data/generation_log.csv`:** benign events and outages: `k
+           ind, sensor_id, start, end`. Never used for scoring. It is onl
+           y for diagnosing false alarms and verifying cleaning.
+      100  
+
+● Update(docs\design.md)
+  ⎿  Added 13 lines
+      161  
+      162  - Everything except `dropped_reading` is recorded in `generati
+           on_log.csv` so cleaning can be verified.
+      163  
+      164 +### Split                                                     
+      165 +                                                              
+      166 +| Split | Days | Dates | Purpose |                            
+      167 +|---|---|---|---|                                             
+      168 +| Train | 1–14 | Mon 2024-01-08 – Sun 2024-01-21 | Fit models 
+          +/ thresholds |                                                
+      169 +| Validation | 15–21 | Mon 2024-01-22 – Sun 2024-01-28 | Thres
+          +hold tuning and model selection |                             
+      170 +| Test | 22–28 | Mon 2024-01-29 – Sun 2024-02-04 | Run once at
+          + the end |                                                    
+      171 +                                                              
+      172 +- One continuous 28-day series is simulated and then cut at th
+          +e split dates. Sensor state carries smoothly across boundaries
+          +.                                                             
+      173 +- No anomaly, benign event or outage crosses a split boundary.
+      174 +- **Three readings files** (`train.csv`, `val.csv`, `test.csv`
+          +). The test file is the input for streaming, and keeping it se
+          +parate makes accidental use during tuning harder.             
+      175 +- One `anomaly_labels.csv` (with a `split` column) and one `ge
+          +neration_log.csv`.                                            
+      176 +                                                              
+      177  ---
+      178  
+      179  ## README Carry-Over
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now the code. I'll put every parameter from the design in config.py, so the
+  generator holds only logic.
+
+● Write(config.py)
+  ⎿  Wrote 148 lines to config.py
+       1 """Central configuration: sensors, dates, splits, seed, paths an
+         d generator parameters.
+       2 
+         (Stage 3).
+       4 """
+       5 
+       6 from pathlib import Path
+       8 # ============================================================
+       9 # Reproducibility
+      10 # ============================================================
+     … +161 lines (ctrl+o to expand)
+
+● Write(generate_data.py)
+  ⎿  Wrote 562 lines to generate_data.py
+      1 """Generate a synthetic 28-day smart-home sensor dataset with inj
+      2 
+      3 Pipeline:
+        e door use)
+      5     2. Plan all injections up front: outages, benign events, anom
+      6     3. Simulate normal sensor behaviour (heating failure is part 
+        of the physics)
+      8     5. Apply data-quality issues (outages, dropped readings, dupl
+        icates)
+        tion log
+     … +674 lines (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && time
+      .venv/Scripts/python generate_data.py)
+  ⎿  C:\Users\Gracy\Projects\Anomaly Detection\generate_data.py:81: Pandas4
+     Warning: Timestamp.dayofweek is deprecated and will be removed in a fu
+     ture version. Use Timestamp.day_of_week instead.
+     … +37 lines (ctrl+o to expand)
+  ⎿  Created data\anomaly_labels.csv (+50 -0)
+       1 +anomaly_id,anomaly_type,sensor_id,start,end,magnitude,magnitude
+         +_unit,split                                                    
+       2 +A001,fridge_power_loss,power_fridge,2024-01-08 04:38,2024-01-08
+         + 07:07,0.07,W,train                                            
+       3 +A002,heating_failure,temp_living_room,2024-01-08 14:13,2024-01-
+         +08 19:07,0.43,degC_per_hour,train                              
+       4 +A003,compressor_stuck_on,power_fridge,2024-01-08 22:33,2024-01-
+         +09 01:00,103.68,W,train                                        
+       5 +A004,intrusion_motion,motion_hallway,2024-01-09 14:48,2024-01-0
+         +9 15:13,0.57,fraction_of_minutes,train                         
+       6 +A005,intrusion_motion,motion_hallway,2024-01-11 13:40,2024-01-1
+         +1 13:51,0.6,fraction_of_minutes,train                          
+       7 +A006,compressor_stuck_on,power_fridge,2024-01-11 21:12,2024-01-
+         +12 00:55,105.89,W,train                                        
+       8 +A007,fridge_power_loss,power_fridge,2024-01-12 07:14,2024-01-12
+         + 10:32,0.49,W,train                                            
+       9 +A008,compressor_stuck_on,power_fridge,2024-01-13 02:32,2024-01-
+         +13 04:49,105.38,W,train                                        
+      10 +A009,door_left_open,door_front,2024-01-13 18:47,2024-01-13 19:4
+         +1,55.0,min,train                                               
+      11 +A010,door_open_night,door_front,2024-01-14 03:04,2024-01-14 03:
+         +06,3.0,min,train                                               
+      12 +A011,heating_failure,temp_living_room,2024-01-14 15:16,2024-01-
+         +14 19:56,0.49,degC_per_hour,train                              
+      13 +A012,heating_failure,temp_living_room,2024-01-15 08:00,2024-01-
+         +15 12:55,0.46,degC_per_hour,train                              
+      14 +A013,door_open_night,door_front,2024-01-17 01:41,2024-01-17 01:
+         +42,2.0,min,train                                               
+      15 +A014,fridge_power_loss,power_fridge,2024-01-17 10:33,2024-01-17
+         + 12:13,0.07,W,train                                            
+      16 +A015,temp_spike,temp_living_room,2024-01-17 17:14,2024-01-17 17
+         +:16,-5.53,degC,train                                           
+      17 +A016,door_open_night,door_front,2024-01-18 04:08,2024-01-18 04:
+         +09,2.0,min,train                                               
+      18 +A017,temp_spike,temp_living_room,2024-01-18 08:15,2024-01-18 08
+         +:17,-6.58,degC,train                                           
+      19 +A018,intrusion_motion,motion_hallway,2024-01-18 11:28,2024-01-1
+         +8 11:35,0.52,fraction_of_minutes,train                         
+      20 +A019,door_left_open,door_front,2024-01-19 12:37,2024-01-19 14:0
+         +0,84.0,min,train                                               
+      21 +A020,temp_spike,temp_living_room,2024-01-20 02:21,2024-01-20 02
+         +:23,4.0,degC,train                                             
+      22 +A021,door_left_open,door_front,2024-01-21 11:49,2024-01-21 12:4
+         +1,53.0,min,train                                               
+      23 +A022,door_open_night,door_front,2024-01-22 01:16,2024-01-22 01:
+         +18,3.0,min,val                                                 
+      24 +A023,heating_failure,temp_living_room,2024-01-22 17:47,2024-01-
+         +22 21:23,0.5,degC_per_hour,val                                 
+      25 +A024,intrusion_motion,motion_hallway,2024-01-23 16:00,2024-01-2
+         +3 16:17,0.58,fraction_of_minutes,val                           
+      26 +A025,fridge_power_loss,power_fridge,2024-01-24 00:04,2024-01-24
+         + 01:06,0.05,W,val                                              
+      27 +A026,fridge_power_loss,power_fridge,2024-01-24 07:01,2024-01-24
+         + 10:23,0.12,W,val                                              
+      28 +A027,temp_spike,temp_living_room,2024-01-24 14:50,2024-01-24 14
+         +:52,5.06,degC,val                                              
+      29 +A028,door_open_night,door_front,2024-01-25 04:29,2024-01-25 04:
+         +31,3.0,min,val                                                 
+      30 +A029,intrusion_motion,motion_hallway,2024-01-25 16:26,2024-01-2
+         +5 16:42,0.5,fraction_of_minutes,val                            
+      31 +A030,compressor_stuck_on,power_fridge,2024-01-27 01:41,2024-01-
+         +27 04:51,127.99,W,val                                          
+      32 +A031,door_left_open,door_front,2024-01-27 08:49,2024-01-27 09:2
+         +7,39.0,min,val                                                 
+      33 +A032,compressor_stuck_on,power_fridge,2024-01-27 12:46,2024-01-
+         +27 15:41,123.54,W,val                                          
+      34 +A033,temp_spike,temp_living_room,2024-01-28 01:45,2024-01-28 01
+         +:46,6.03,degC,val                                              
+      35 +A034,heating_failure,temp_living_room,2024-01-28 13:40,2024-01-
+         +28 17:52,0.37,degC_per_hour,val                                
+      36 +A035,door_left_open,door_front,2024-01-28 20:02,2024-01-28 21:2
+         +2,81.0,min,val                                                 
+      37 +A036,compressor_stuck_on,power_fridge,2024-01-29 03:30,2024-01-
+         +29 05:47,103.46,W,test                                         
+      38 +A037,compressor_stuck_on,power_fridge,2024-01-29 08:51,2024-01-
+         +29 10:56,105.24,W,test                                         
+      39 +A038,door_left_open,door_front,2024-01-29 20:40,2024-01-29 21:1
+         +9,40.0,min,test                                                
+      40 +A039,temp_spike,temp_living_room,2024-01-30 06:28,2024-01-30 06
+         +:30,-3.22,degC,test                                            
+     … 10 more lines (ctrl+o to expand)
+  ⎿  Created data\generation_log.csv (+37 -0)
+       1 +kind,sensor_id,start,end,split                                 
+       2 +night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+         +02:13,train                                                    
+       3 +sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+         +n                                                              
+       4 +night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+         +04:53,train                                                    
+       5 +duplicate_row,all,2024-01-09 11:44,2024-01-09 11:44,train      
+       6 +sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+         +ain                                                            
+       7 +night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+         +01:37,train                                                    
+       8 +night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+         +04:02,train                                                    
+       9 +duplicate_row,all,2024-01-15 17:45,2024-01-15 17:45,train      
+      10 +sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+         +3,train                                                        
+      11 +sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+         +train                                                          
+      12 +night_bathroom_trip,motion_hallway,2024-01-19 03:16,2024-01-19 
+         +03:17,train                                                    
+      13 +night_bathroom_trip,motion_hallway,2024-01-20 03:11,2024-01-20 
+         +03:11,train                                                    
+      14 +weekend_guests,motion_hallway;door_front,2024-01-20 20:01,2024-
+         +01-20 23:06,train                                              
+      15 +hub_outage,all,2024-01-21 09:39,2024-01-21 10:04,train         
+      16 +night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+         +04:03,val                                                      
+      17 +sensor_outage,motion_hallway,2024-01-22 13:52,2024-01-22 14:08,
+         +val                                                            
+      18 +night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+         +04:52,val                                                      
+      19 +duplicate_row,all,2024-01-23 12:29,2024-01-23 12:29,val        
+      20 +hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val           
+      21 +sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+         +9,val                                                          
+      22 +night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+         +03:51,val                                                      
+      23 +duplicate_row,all,2024-01-26 05:12,2024-01-26 05:12,val        
+      24 +sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val 
+      25 +sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+         +l                                                              
+      26 +weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+         +01-27 23:15,val                                                
+      27 +sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+         +7,test                                                         
+      28 +hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test          
+      29 +sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+         +st                                                             
+      30 +duplicate_row,all,2024-02-02 02:39,2024-02-02 02:39,test       
+      31 +night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+         +03:27,test                                                     
+      32 +night_bathroom_trip,motion_hallway,2024-02-03 01:21,2024-02-03 
+         +01:23,test                                                     
+      33 +night_bathroom_trip,motion_hallway,2024-02-03 02:31,2024-02-03 
+         +02:34,test                                                     
+      34 +sensor_outage,motion_hallway,2024-02-03 14:50,2024-02-03 15:51,
+         +test                                                           
+      35 +weekend_guests,motion_hallway;door_front,2024-02-03 19:10,2024-
+         +02-03 22:42,test                                               
+      36 +duplicate_row,all,2024-02-03 21:27,2024-02-03 21:27,test       
+      37 +sensor_outage,door_front,2024-02-04 15:36,2024-02-04 16:14,test
+  ⎿  … 4 more files changed
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && sed -i
+      's/\.dayofweek/.day_of_week/g' generate_data.py && .venv/Scripts/python
+      generate_data.py > /dev/null &&…)
+  ⎿                          timestamp  temp_living_room  power_fridge  mot
+     ion_hallway  door_front
+     count                       40227          39898.00      39992.00
+     … +47 lines (ctrl+o to expand)
+  ⎿  Updated generate_data.py (+2 -2)
+      78  
+      79      for day in range(cfg.N_DAYS):
+      80          day0 = day * MIN_PER_DAY
+      81 -        weekday = index[day0].dayofweek                        
+      81 +        weekday = index[day0].day_of_week                      
+      82  
+      83          # Sleep / wake
+      84          wake = day0 + occ["wake_mean"] + time_jitter(rng)
+     ...
+      194  
+      195      guests = cfg.BENIGN["weekend_guests"]
+      196      w0, w1 = guests["window"]
+      197 -    saturday_evening = (index.dayofweek == 5) & (tod >= w0) & 
+          -(tod < w1)                                                    
+      197 +    saturday_evening = (index.day_of_week == 5) & (tod >= w0) 
+          +& (tod < w1)                                                  
+      198      for split, (lo, hi) in bounds.items():
+      199          for _ in range(guests["per_split"]):
+      200              dur = int(rng.uniform(*guests["hours"]) * 60)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && printf
+      "numpy==2.5.4\npandas==3.1.0\n" > requirements.txt && printf
+      ".venv/\n__pycache__/\n.ipynb_checkpoints/…)
+  ⎿   M docs/design.md
+      M docs/plan.md
+     ?? .gitignore
+     … +5 lines (ctrl+o to expand)
+  ⎿  Created .gitignore (+3 -0)
+      1 +.venv/                                                          
+      2 +__pycache__/                                                    
+      3 +.ipynb_checkpoints/                                             
+  ⎿  Created requirements.txt (+2 -0)
+      1 +numpy==2.5.4                                                    
+      2 +pandas==3.1.0                                                   
+
+  Ran 1 shell command (ctrl+o to expand)
+● I've written config.py and generate_data.py and run the generator. It finishes
+  in under a second. Your check on the anomaly rate shows it is too high.
+
+  Files created:
+  - config.py holds every parameter and the seed (42).
+  - generate_data.py is split into 7 headed sections: timeline, occupancy,
+    planning, normal sensors, overlays, data quality, and save. Each step is a
+    small function.
+  - data/: train.csv, val.csv, test.csv, anomaly_labels.csv and
+    generation_log.csv.
+  - requirements.txt (numpy, pandas) and .gitignore (covers .venv/).
+
+  Checks on the generated data (from the run):
+  - Counts: exactly 3/2/2 anomalies per type in train/val/test, and every benign
+    event and outage appears in every split, as designed.
+  - Fridge: compressor on 41% of the time; defrost readings make up 3% of all
+    readings.
+  - Door: about 4.7 openings per day.
+  - Motion: none at all on Tue–Thu daytime outside the intrusions, and about
+    0.10 per minute on Mon/Fri daytime.
+  - Heating failures: the measured temperature drops range from 1.50 to 2.24 °C,
+    so all meet the 1.5 °C minimum.
+  - Intrusions: no door opening during any of them, as designed.
+
+  Anomalous minutes, as a % of each split:
+
+  ┌─────────────────┬─────────────┬─────────┬─────────┬─────────┬───────────┐
+  │     Version     │ Temperature │ Fridge  │ Motion  │  Door   │   Any     │
+  │                 │             │         │         │         │  sensor   │
+  ├─────────────────┼─────────────┼─────────┼─────────┼─────────┼───────────┤
+  │ Current ranges  │ 4.4–4.7     │ 4.8–6.3 │ 0.2–0.4 │ 0.8–1.3 │ 10.4–12.6 │
+  ├─────────────────┼─────────────┼─────────┼─────────┼─────────┼───────────┤
+  │ Trial with      │ 2.7–3.1     │ 2.3–3.3 │ 0.2–0.4 │ 1.0–1.3 │ 6.2–8.0   │
+  │ shorter ranges* │             │         │         │         │           │
+  └─────────────────┴─────────────┴─────────┴─────────┴─────────┴───────────┘
+
+  *The trial was run in a scratch folder; the files in data/ are untouched. It
+  changed three anomaly types:
+  - heating_failure: 1.5–3 h at 0.5–1.0 °C/h. The total drop is still at least
+    1.5 °C.
+  - fridge_power_loss: 45–120 min.
+  - compressor_stuck_on: 1–2 h. That's still more than 3× the longest normal
+    run.
+
+  The long anomalies make up most of the anomalous time. Shortening them roughly
+  halves the temperature and fridge rates. "Any sensor" stays around 6–8%
+  because the four sensors add up.
+
+  Question: Should I apply the shorter ranges? Or would you like to go further,
+  for example a per-sensor target of at most 2%?
+
+✻ Baked for 5m 31s · done Friday 5:36 PM
+
+※ recap: We're building the synthetic smart-home dataset, and the generator works, but about 10–12% of minutes are anomalous. Next step: you decide whether I apply the shorter anomaly durations (about 6–8%) or aim lower.
+
+❯ Apply the shorter ranges. Per sensor is not needed. Also I ahev some reviewer 
+  agent findings. Take a look and let me know how we are going to work through  
+  them and then one i give a go ahead yo can update                             
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I couldn't locate the reviewer findings anywhere—not in your message or any
+  repo file (the generate_data.py change on disk was just my own deprecation
+  fix). I'll go ahead and apply the shorter ranges now.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && sed -i \
+       -e 's/"sensor": TEMP, "hours": (2, 5), "magnitude": (0.3, 0.8), "unit":
+      "degC_per_hour",/"sensor": T…)
+  ⎿  116:        "sensor": TEMP, "hours": (1.5, 3), "magnitude": (0.5, 1.0)
+     , "unit": "degC_per_hour",
+     119:        "sensor": POWER, "hours": (0.75, 2), "magnitude": (0.0, 0.
+     … +16 lines (ctrl+o to expand)
+  ⎿  Updated config.py (+3 -3)
+      113      "temp_spike": {
+      114          "sensor": TEMP, "minutes": (1, 3), "magnitude": (3.0, 
+           8.0), "unit": "degC"},
+      115      "heating_failure": {
+      116 -        "sensor": TEMP, "hours": (2, 5), "magnitude": (0.3, 0.
+          -8), "unit": "degC_per_hour",                                  
+      116 +        "sensor": TEMP, "hours": (1.5, 3), "magnitude": (0.5, 
+          +1.0), "unit": "degC_per_hour",                                
+      117          "min_total_drop": 1.5},
+      118      "fridge_power_loss": {
+      119 -        "sensor": POWER, "hours": (1, 4), "magnitude": (0.0, 0
+          -.5), "unit": "W"},                                            
+      119 +        "sensor": POWER, "hours": (0.75, 2), "magnitude": (0.0
+          +, 0.5), "unit": "W"},                                         
+      120      "compressor_stuck_on": {
+      121 -        "sensor": POWER, "hours": (2, 4), "magnitude": (100, 1
+          -30), "unit": "W"},                                            
+      121 +        "sensor": POWER, "hours": (1, 2), "magnitude": (100, 1
+          +30), "unit": "W"},                                            
+      122      "intrusion_motion": {
+      123          "sensor": MOTION, "minutes": (5, 30), "magnitude": (0.
+           3, 0.6), "unit": "fraction_of_minutes",
+      124          "empty_margin_minutes": 15},
+  ⎿  Updated data\anomaly_labels.csv (+36 -36)
+       1  anomaly_id,anomaly_type,sensor_id,start,end,magnitude,magnitude
+          _unit,split
+       2 -A001,fridge_power_loss,power_fridge,2024-01-08 04:38,2024-01-08
+         - 07:07,0.07,W,train                                            
+       3 -A002,heating_failure,temp_living_room,2024-01-08 14:13,2024-01-
+         -08 19:07,0.43,degC_per_hour,train                              
+       4 -A003,compressor_stuck_on,power_fridge,2024-01-08 22:33,2024-01-
+         -09 01:00,103.68,W,train                                        
+       2 +A001,fridge_power_loss,power_fridge,2024-01-08 04:40,2024-01-08
+         + 05:41,0.07,W,train                                            
+       3 +A002,heating_failure,temp_living_room,2024-01-08 14:19,2024-01-
+         +08 17:16,0.63,degC_per_hour,train                              
+       4 +A003,compressor_stuck_on,power_fridge,2024-01-08 22:38,2024-01-
+         +08 23:51,103.68,W,train                                        
+       5  A004,intrusion_motion,motion_hallway,2024-01-09 14:48,2024-01-0
+          9 15:13,0.57,fraction_of_minutes,train
+       6 -A005,intrusion_motion,motion_hallway,2024-01-11 13:40,2024-01-1
+         -1 13:51,0.6,fraction_of_minutes,train                          
+       7 -A006,compressor_stuck_on,power_fridge,2024-01-11 21:12,2024-01-
+         -12 00:55,105.89,W,train                                        
+       8 -A007,fridge_power_loss,power_fridge,2024-01-12 07:14,2024-01-12
+         - 10:32,0.49,W,train                                            
+       9 -A008,compressor_stuck_on,power_fridge,2024-01-13 02:32,2024-01-
+         -13 04:49,105.38,W,train                                        
+      10 -A009,door_left_open,door_front,2024-01-13 18:47,2024-01-13 19:4
+         -1,55.0,min,train                                               
+      11 -A010,door_open_night,door_front,2024-01-14 03:04,2024-01-14 03:
+         -06,3.0,min,train                                               
+      12 -A011,heating_failure,temp_living_room,2024-01-14 15:16,2024-01-
+         -14 19:56,0.49,degC_per_hour,train                              
+      13 -A012,heating_failure,temp_living_room,2024-01-15 08:00,2024-01-
+         -15 12:55,0.46,degC_per_hour,train                              
+      14 -A013,door_open_night,door_front,2024-01-17 01:41,2024-01-17 01:
+         -42,2.0,min,train                                               
+      15 -A014,fridge_power_loss,power_fridge,2024-01-17 10:33,2024-01-17
+         - 12:13,0.07,W,train                                            
+      16 -A015,temp_spike,temp_living_room,2024-01-17 17:14,2024-01-17 17
+         -:16,-5.53,degC,train                                           
+       6 +A005,temp_spike,temp_living_room,2024-01-10 19:07,2024-01-10 19
+         +:08,6.47,degC,train                                            
+       7 +A006,intrusion_motion,motion_hallway,2024-01-11 13:40,2024-01-1
+         +1 13:51,0.6,fraction_of_minutes,train                          
+       8 +A007,temp_spike,temp_living_room,2024-01-12 03:37,2024-01-12 03
+         +:37,3.61,degC,train                                            
+       9 +A008,fridge_power_loss,power_fridge,2024-01-12 11:17,2024-01-12
+         + 12:24,0.39,W,train                                            
+      10 +A009,compressor_stuck_on,power_fridge,2024-01-13 02:57,2024-01-
+         +13 04:05,105.38,W,train                                        
+      11 +A010,door_left_open,door_front,2024-01-13 18:47,2024-01-13 19:4
+         +1,55.0,min,train                                               
+      12 +A011,door_open_night,door_front,2024-01-14 03:04,2024-01-14 03:
+         +06,3.0,min,train                                               
+      13 +A012,heating_failure,temp_living_room,2024-01-14 16:06,2024-01-
+         +14 18:57,0.69,degC_per_hour,train                              
+      14 +A013,heating_failure,temp_living_room,2024-01-15 09:00,2024-01-
+         +15 11:57,0.66,degC_per_hour,train                              
+      15 +A014,compressor_stuck_on,power_fridge,2024-01-16 08:16,2024-01-
+         +16 10:07,105.89,W,train                                        
+      16 +A015,door_open_night,door_front,2024-01-17 01:41,2024-01-17 01:
+         +42,2.0,min,train                                               
+      17  A016,door_open_night,door_front,2024-01-18 04:08,2024-01-18 04:
+          09,2.0,min,train
+      18 -A017,temp_spike,temp_living_room,2024-01-18 08:15,2024-01-18 08
+         -:17,-6.58,degC,train                                           
+      18 +A017,temp_spike,temp_living_room,2024-01-18 08:15,2024-01-18 08
+         +:17,6.58,degC,train                                            
+      19  A018,intrusion_motion,motion_hallway,2024-01-18 11:28,2024-01-1
+          8 11:35,0.52,fraction_of_minutes,train
+      20  A019,door_left_open,door_front,2024-01-19 12:37,2024-01-19 14:0
+          0,84.0,min,train
+      21 -A020,temp_spike,temp_living_room,2024-01-20 02:21,2024-01-20 02
+         -:23,4.0,degC,train                                             
+      21 +A020,fridge_power_loss,power_fridge,2024-01-21 00:40,2024-01-21
+         + 02:01,0.07,W,train                                            
+      22  A021,door_left_open,door_front,2024-01-21 11:49,2024-01-21 12:4
+          1,53.0,min,train
+      23  A022,door_open_night,door_front,2024-01-22 01:16,2024-01-22 01:
+          18,3.0,min,val
+      24 -A023,heating_failure,temp_living_room,2024-01-22 17:47,2024-01-
+         -22 21:23,0.5,degC_per_hour,val                                 
+     … 46 more lines (ctrl+o to expand)
+  ⎿  Updated data\generation_log.csv (+6 -6)
+       2  night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+          02:13,train
+       3  sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+          n
+       4  night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+          04:53,train
+       5 -duplicate_row,all,2024-01-09 11:44,2024-01-09 11:44,train      
+       5  sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+          ain
+       6  night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+          01:37,train
+       7  night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+          04:02,train
+       9 -duplicate_row,all,2024-01-15 17:45,2024-01-15 17:45,train      
+       8  sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+          3,train
+       9  sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+          train
+      10  night_bathroom_trip,motion_hallway,2024-01-19 03:16,2024-01-19 
+          03:17,train
+      11 +duplicate_row,all,2024-01-20 02:24,2024-01-20 02:24,train      
+      12  night_bathroom_trip,motion_hallway,2024-01-20 03:11,2024-01-20 
+          03:11,train
+      13 +duplicate_row,all,2024-01-20 15:14,2024-01-20 15:14,train      
+      14  weekend_guests,motion_hallway;door_front,2024-01-20 20:01,2024-
+          01-20 23:06,train
+      15  hub_outage,all,2024-01-21 09:39,2024-01-21 10:04,train
+      16  night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+          04:03,val
+      17  sensor_outage,motion_hallway,2024-01-22 13:52,2024-01-22 14:08,
+          val
+      18  night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+          04:52,val
+      19 -duplicate_row,all,2024-01-23 12:29,2024-01-23 12:29,val        
+      19  hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val
+      20  sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+          9,val
+      21  night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+          03:51,val
+      23 -duplicate_row,all,2024-01-26 05:12,2024-01-26 05:12,val        
+      22  sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val
+      23 +duplicate_row,all,2024-01-26 22:07,2024-01-26 22:07,val        
+      24  sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+          l
+      25 +duplicate_row,all,2024-01-27 11:00,2024-01-27 11:00,val        
+      26  weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+          01-27 23:15,val
+      27 +duplicate_row,all,2024-01-29 16:33,2024-01-29 16:33,test       
+      28  sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+          7,test
+      29  hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test
+      30  sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+          st
+      30 -duplicate_row,all,2024-02-02 02:39,2024-02-02 02:39,test       
+      31 +duplicate_row,all,2024-02-01 20:59,2024-02-01 20:59,test       
+      32  night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+          03:27,test
+      33  night_bathroom_trip,motion_hallway,2024-02-03 01:21,2024-02-03 
+          01:23,test
+      34  night_bathroom_trip,motion_hallway,2024-02-03 02:31,2024-02-03 
+          02:34,test
+      35  sensor_outage,motion_hallway,2024-02-03 14:50,2024-02-03 15:51,
+          test
+      36  weekend_guests,motion_hallway;door_front,2024-02-03 19:10,2024-
+          02-03 22:42,test
+     … 2 more lines (ctrl+o to expand)
+  ⎿  … 3 more files changed
+
+● The new numbers match the trial run exactly, so the seed reproduces the data.
+  Now I'll update the anomaly table in design.md.
+
+● Update(docs\design.md)
+  ⎿  Added 3 lines, removed 3 lines
+      126  | Type | When allowed | Duration | Magnitude (unit) |
+      127  |---|---|---|---|
+      128  | `temp_spike` | Any time | 1–3 min | ±3–8 (°C jump, random si
+           gn) |
+      129 -| `heating_failure` | Entire window inside a 21 °C target peri
+          -od | 2–5 h | Fall rate 0.3–0.8 °C/h, **total drop ≥ 1.5 °C**, 
+          -then normal recovery |                                        
+      130 -| `fridge_power_loss` | Any time | 1–4 h | Power reads 0–0.5 W
+          - |                                                            
+      131 -| `compressor_stuck_on` | Any time | 2–4 h | Constant 100–130 
+          -W (normal run ≤ 18 min) |                                     
+      129 +| `heating_failure` | Entire window inside a 21 °C target peri
+          +od | 1.5–3 h | Fall rate 0.5–1.0 °C/h, **total drop ≥ 1.5 °C**
+          +, then normal recovery |                                      
+      130 +| `fridge_power_loss` | Any time | 45–120 min | Power reads 0–
+          +0.5 W |                                                       
+      131 +| `compressor_stuck_on` | Any time | 1–2 h | Constant 100–130 
+          +W (normal run ≤ 18 min) |                                     
+      132  | `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+            min | Share of minutes with motion 0.3–0.6, no door opening |
+      133  | `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, wi
+           th hallway motion around it |
+      134  | `door_left_open` | Awake and home | 30–90 min | Minutes open
+            (normal 1–3 min) |
+
+● Update(docs\design.md)
+  ⎿  Added 8 lines, removed 1 line
+      133  | `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, wi
+           th hallway motion around it |
+      134  | `door_left_open` | Awake and home | 30–90 min | Minutes open
+            (normal 1–3 min) |
+      135  
+      136 -- **Heating failure ≥ 1.5 °C:** sample the fall rate first, th
+          -en the duration from [max(2 h, 1.5 / rate), 5 h]. At the lowes
+          -t rate this forces a 5 h failure.                             
+      136 +- **Heating failure ≥ 1.5 °C:** sample the fall rate first, th
+          +en the duration from [max(1.5 h, 1.5 / rate), 3 h]. At the low
+          +est rate this forces a 3 h failure.                           
+      137 +- **Durations shortened after the first generation:** the orig
+          +inal ranges (heating 2–5 h, power loss 1–4 h, stuck-on 2–4 h) 
+          +gave 10.4–12.6% anomalous minutes per split. The shorter range
+          +s give the following (measured, seed 42):                     
+      138 +                                                              
+      139 +  | Split | Temp | Fridge | Motion | Door | Any sensor |      
+      140 +  |---|---|---|---|---|---|                                   
+      141 +  | Train | 2.65% | 2.32% | 0.23% | 0.99% | 6.18% |           
+      142 +  | Val | 3.10% | 3.30% | 0.35% | 1.25% | 8.00% |             
+      143 +  | Test | 3.03% | 2.30% | 0.37% | 0.99% | 6.69% |            
+      144  - **Placement:**
+      145    - No overlap between anomalies, with a gap of at least 2 h.
+      146    - Anomalies never overlap benign events or outages, so each 
+           label stays unambiguous.
+
+● I've applied the shorter ranges and regenerated the data:
+  - Heating failure: 1.5–3 h, falling 0.5–1.0 °C/h.
+  - Fridge power loss: 45–120 min.
+  - Compressor stuck on: 1–2 h.
+
+  The anomalous minutes now match the trial: 6.2–8.0% of each split overall, and
+  2.3–3.3% for each of temperature and fridge. config.py, the files in data/,
+  and the anomaly table in design.md are all updated, including the measured
+  rates.
+
+  I couldn't find the reviewer agent's findings. They aren't in your message or
+  anywhere in the repo. Could you paste them here or tell me the file path? Then
+  I'll sort them by priority and suggest an order for working through them, and
+  won't change anything until you say go.
+
+✻ Baked for 30s · done Friday 9:10 PM
+
+❯ Reviewer findings:                                                            
+  1. High: fridge idle noise hides power loss (anomaly can't be identified)     
+  - Reason: Idle power is 2–5 W with ±2 W noise, clipped at 0. About 20% of     
+  normal idle minutes read ≤ 0.5 W, which is the same range as                  
+  fridge_power_loss.                                                            
+  - Fix: In config.FRIDGE, replace noise_sd with noise_sd_on: 2.0 and           
+  noise_sd_off: 0.3. In simulate_fridge, add noise per state (compressor        
+  running/defrost uses noise_sd_on, idle uses noise_sd_off) and clip at 0.      
+                                                                                
+  2. High: normal nightly cooling is faster than a heating failure (changes     
+  results, unrealistic)                                                         
+  - Reason: One 45-min lag is used for both heating and cooling, so the 23:00   
+  setback cools at about 4 °C/h. That makes a boiler failure (0.3–0.8 °C/h)     
+  gentler than an ordinary night.                                               
+  - Fix: In config.TEMPERATURE, split lag_minutes into lag_heat_minutes: 45 and 
+  lag_cool_minutes: 300. In simulate_temperature, use the heat lag when target  
+  + solar > current and the cool lag otherwise.                                 
+                                                                                
+  3. Medium: anomaly rate is too high (contradicts the design)                  
+  - Reason: The labels put about 12% of val/test minutes inside an anomaly      
+  (fridge ~6%, temp ~5%). The design says to keep the rate small and shorten    
+  long anomalies when it's too high.                                            
+  - Fix: In config.ANOMALIES, set:                                              
+    - fridge_power_loss.hours: (0.75, 2)                                        
+    - compressor_stuck_on.hours: (1, 2)                                         
+    - heating_failure.magnitude: (0.5, 1.0) and hours: (1.5, 3)                 
+    - door_left_open.minutes: (20, 60)                                          
+                                                                                
+    Then re-run and check that any_sensor is ≤ ~5% per split.                   
+                                                                                
+  4. Medium: motion before an arrival looks like an intrusion (changes results) 
+  - Reason: open_door always adds motion before the door opens. On arrival the  
+  house is still empty, so the data shows motion in an empty house, the same    
+  pattern as intrusion_motion. The detector will raise false alarms on every    
+  return home.                                                                  
+  - Fix: In open_door, only add the pre-opening motion when start > 0 and       
+  n_home[start - 1] > 0. Keep the post-closing motion rule as it is.            
+                                                                                
+  5. Medium: zero motion when the house is empty makes intrusion trivial        
+  (changes results)                                                             
+  - Reason: MOTION_PROB["away"] = 0.0, so any single motion minute in an empty  
+  house is a guaranteed intrusion. Intrusion recall is inflated and the         
+  detector is never tested against sensor false triggers.                       
+  - Fix: In config.MOTION_PROB, set "away": 0.001, which gives roughly one      
+  stray trigger per empty day. Update the "0 when away" line in design.md Stage 
+  3 to match.                                                                   
+                                                                                
+  6. Medium: heating-failure recovery is unlabelled (changes results)           
+  - Reason: The label ends when the temperature stops falling, but the room     
+  stays 1.5–4 °C below normal for 1–2 h while it recovers. Correct detections   
+  in that window will be scored as false alarms.                                
+  - Fix: In main, also simulate the temperature with no failures. Then extend   
+  each heating_failure label's end to the first minute where the real series is 
+  back within 0.3 °C of the no-failure series, still before the split           
+  boundary.                                                                     
+
+● Before planning, I'll check the reviewer's claims against the generated data.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I checked each finding against the current data. All six are valid. #3 is
+  mostly done already, and #6 interacts with it.
+
+  #: 1
+  Finding: Fridge idle noise looks like a power loss
+  Checked against the data: Confirmed: 8.9% of normal idle minutes read ≤ 0.5 W
+  (the reviewer said ~20%)
+  My view: Agree, apply. An idle fridge reading 0 W is also physically wrong.
+  ────────────────────────────────────────
+  #: 2
+  Finding: Night cooling is faster than a heating failure
+  Checked against the data: Confirmed: a normal night setback drops about 2.0 °C
+
+  in its first hour
+  My view: Agree, apply, highest priority. It's the physics bug the other
+  temperature fixes depend on. With a 300-min cooling lag, a night drops about
+  0.6 °C/h, which is realistic.
+  ────────────────────────────────────────
+  #: 3
+  Finding: Anomaly rate too high
+  Checked against the data: Mostly already done: we applied the same ranges, now
+
+  at 6.2–8.0%
+  My view: Partly. Shortening door_left_open to 20–60 min is reasonable. But "≤
+  5%" is the reviewer's target, not yours, and #6 will push the temperature
+  rate back up. I'd re-measure after all the fixes and then decide.
+  ────────────────────────────────────────
+  #: 4
+  Finding: Motion before an arrival looks like an intrusion
+  Checked against the data: Confirmed: 26 Tue–Thu evening arrivals have motion
+  before the door opens
+  My view: Agree, apply. An indoor sensor can't see someone before the door
+  opens.
+  ────────────────────────────────────────
+  #: 5
+  Finding: Zero motion when empty makes intrusion detection trivial
+  Checked against the data: Follows from the config (0.0)
+  My view: Agree, apply. Note that 0.001 per minute gives about 0.5 stray
+  triggers per empty day, not 1. Still fine.
+  ────────────────────────────────────────
+  #: 6
+  Finding: Heating-failure recovery is unlabelled
+  Checked against the data: Confirmed: the room stays below normal for about 45
+  min–2 h after the label ends
+  My view: Agree, with one implementation change. The reviewer says to simulate
+  temperature twice. But the simulation adds random noise, so a second run
+  would use up random numbers and change every sensor generated after it. I'd
+  split the function so the noise-free physics can run twice, and compare the
+  noise-free series.
+
+  Order (all changes in config.py, generate_data.py and design.md):
+  1. #2 cooling lag, first, because #6 depends on it.
+  2. #1 idle noise.
+  3. #4 no motion before an arrival.
+  4. #5 stray motion when empty.
+  5. #6 extend heating-failure labels to cover recovery.
+  6. #3 shorten door_left_open, regenerate, and report the measured anomaly
+     rates. You then decide whether anything else needs shortening.
+
+  After that I'll re-run the sanity checks above and update design.md.
+
+  Question: Should I go ahead in this order? And for #3, do you want to adopt
+  the reviewer's "any sensor ≤ ~5%" target, or keep "small, judged after
+  measuring"?
+
+✻ Worked for 42s · done Friday 9:12 PM
+
+※ recap: We're building the synthetic smart-home dataset for your anomaly-detection take-home, and I've checked the six reviewer findings against the data. Next, you approve the fix order and decide whether to adopt the reviewer's 5% anomaly-rate target. (disable recaps in /config)
+
+❯ go ahead for now. Once Done, provide a table on all anomalies based its typoe 
+   and sensor in detail so i can review the chnages                             
+
+  Read 2 files (ctrl+o to expand)
+
+● Update(config.py)
+  ⎿  Added 2 lines, removed 1 line
+      73      "target_home": 21.0,
+      74      "target_night": 18.0,
+      75      "target_eco": 18.0,                      # house empty
+      76 -    "lag_minutes": 45,                       # first-order time
+         - constant                                                      
+      76 +    "lag_heat_minutes": 45,                  # time constant wh
+         +en heating up                                                  
+      77 +    "lag_cool_minutes": 300,                 # time constant wh
+         +en cooling down (slower)                                       
+      78      "solar_gain": 0.5,                       # peak extra degC
+      79      "solar_window": (12 * 60, 16 * 60),
+      80      "noise_sd": 0.1,
+
+● Update(config.py)
+  ⎿  Added 2 lines, removed 1 line
+      85      "off_power": (2, 5),
+      86      "on_minutes": (12, 18),
+      87      "off_minutes": (18, 30),
+      88 -    "noise_sd": 2.0,                                           
+      88 +    "noise_sd_on": 2.0,                      # compressor runni
+         +ng / defrost                                                   
+      89 +    "noise_sd_off": 0.3,                     # idle (keeps idle
+         + clearly above 0 W)                                            
+      90      "meal_on_factor": 1.2,                   # longer runs at m
+          ealtimes
+      91      "meal_windows": [(7 * 60, 8 * 60 + 30), (12 * 60, 13 * 60 +
+           30), (18 * 60, 20 * 60 + 30)],
+      92      "defrost_every_hours": (9.5, 10.5),
+
+● Update(config.py)
+  ⎿  Added 1 line, removed 1 line
+       96  
+       97  MOTION_PROB = {
+       98      "asleep": 0.005,
+       99 -    "away": 0.0,                                              
+       99 +    "away": 0.001,                           # stray sensor tr
+          +iggers in an empty house                                      
+      100      "home_base": 0.10,
+      101      "home_morning": 0.30,
+      102      "home_evening": 0.25,
+
+● Update(config.py)
+  ⎿  Added 3 lines, removed 1 line
+      116          "sensor": TEMP, "minutes": (1, 3), "magnitude": (3.0, 
+           8.0), "unit": "degC"},
+      117      "heating_failure": {
+      118          "sensor": TEMP, "hours": (1.5, 3), "magnitude": (0.5, 
+           1.0), "unit": "degC_per_hour",
+      119 -        "min_total_drop": 1.5},                               
+      119 +        "min_total_drop": 1.5,                                
+      120 +        "recovery_tolerance": 0.3,           # label ends when
+          + within this of the no-failure series                         
+      121 +        "recovery_reserve_minutes": 150},    # kept free after
+          + the failure for the recovery                                 
+      122      "fridge_power_loss": {
+      123          "sensor": POWER, "hours": (0.75, 2), "magnitude": (0.0
+           , 0.5), "unit": "W"},
+      124      "compressor_stuck_on": {
+
+● Update(config.py)
+  ⎿  Added 1 line, removed 1 line
+      129      "door_open_night": {
+      130          "sensor": DOOR, "minutes": (1, 5), "unit": "min", "win
+           dow": (30, 5 * 60)},
+      131      "door_left_open": {
+      132 -        "sensor": DOOR, "minutes": (30, 90), "unit": "min"},  
+      132 +        "sensor": DOOR, "minutes": (20, 60), "unit": "min"},  
+      133  }
+      134  
+      135  # ============================================================
+
+● Now generate_data.py. First, #2 (separate heating and cooling lags) and #6
+  (noise-free physics kept apart from the noise):
+
+● Update(generate_data.py)
+  ⎿  Added 14 lines, removed 6 lines
+      282      return t["solar_gain"] * np.sin(np.pi * phase)
+      283  
+      284  
+      285 -def simulate_temperature(target, solar, fall_rate, rng):      
+      286 -    """First-order lag towards target + solar gain; heating fa
+          -ilure overrides with a steady fall.                           
+      285 +def temperature_physics(target, solar, fall_rate):            
+      286 +    """Noise-free room temperature.                           
+      287  
+      288 -    fall_rate: degC/hour per minute, NaN where heating works n
+          -ormally.                                                      
+      288 +    First-order lag towards target + solar gain: fast when hea
+          +ting, slow when cooling.                                      
+      289 +    Heating failure overrides with a steady fall (fall_rate in
+          + degC/hour, NaN = heating works).                             
+      290      """
+      291      t = cfg.TEMPERATURE
+      291 -    alpha = 1.0 / t["lag_minutes"]                            
+      292 +    alpha_heat = 1.0 / t["lag_heat_minutes"]                  
+      293 +    alpha_cool = 1.0 / t["lag_cool_minutes"]                  
+      294      temp = np.empty(len(target))
+      295      current = target[0]
+      296      for i in range(len(target)):
+      297          if np.isnan(fall_rate[i]):
+      296 -            current += (target[i] + solar[i] - current) * alph
+          -a                                                             
+      298 +            goal = target[i] + solar[i]                       
+      299 +            current += (goal - current) * (alpha_heat if goal 
+          +> current else alpha_cool)                                    
+      300          else:
+      301              current -= fall_rate[i] / 60.0
+      302          temp[i] = current
+      300 -    return temp + rng.normal(0, t["noise_sd"], len(temp))     
+      303 +    return temp                                               
+      304  
+      305  
+      306 +def add_sensor_noise(values, sd, rng):                        
+      307 +    """Gaussian measurement noise."""                         
+      308 +    return values + rng.normal(0, sd, len(values))            
+      309 +                                                              
+      310 +                                                              
+      311  def simulate_fridge(tod, n_home, rng):
+      312      """Compressor on/off cycles, longer runs at mealtimes, per
+           iodic defrost."""
+      313      f = cfg.FRIDGE
+
+● Update(generate_data.py)
+  ⎿  Added 1 line
+      313      f = cfg.FRIDGE
+      314      n = len(tod)
+      315      power = np.empty(n)
+      316 +    running = np.zeros(n, dtype=bool)        # compressor or d
+          +efrost heater on                                              
+      317      next_defrost = int(rng.uniform(*f["defrost_every_hours"]) 
+           * 60)
+      318      i = 0
+      319      while i < n:
+
+● Update(generate_data.py)
+  ⎿  Added 1 line
+      319      while i < n:
+      320          if i >= next_defrost:
+      321              power[i:i + f["defrost_minutes"]] = rng.uniform(*f
+           ["defrost_power"])
+      322 +            running[i:i + f["defrost_minutes"]] = True        
+      323              i += f["defrost_minutes"]
+      324              next_defrost = i + int(rng.uniform(*f["defrost_eve
+           ry_hours"]) * 60)
+      325              continue
+● Update(generate_data.py)
+  ⎿  Added 5 lines, removed 1 line
+      328          if is_meal and n_home[i] > 0:
+      329              on = round(on * f["meal_on_factor"])
+      330          power[i:i + on] = rng.uniform(*f["on_power"])
+      331 +        running[i:i + on] = True                              
+      332          i += on
+      333          off = randint(rng, f["off_minutes"])
+      334          power[i:i + off] = rng.uniform(*f["off_power"])
+      335          i += off
+      335 -    return np.clip(power + rng.normal(0, f["noise_sd"], n), 0,
+          - None)                                                        
+      336  
+      337 +    # Noise depends on state: larger when running, small at id
+          +le                                                            
+      338 +    noise_sd = np.where(running, f["noise_sd_on"], f["noise_sd
+          +_off"])                                                       
+      339 +    return np.clip(power + rng.normal(0, 1, n) * noise_sd, 0, 
+          +None)                                                         
+      340  
+      341 +                                                              
+      342  def motion_probability(tod, occupancy):
+      343      """Per-minute motion probability from occupancy and time o
+           f day."""
+      344      m = cfg.MOTION_PROB
+
+● Update(generate_data.py)
+  ⎿  Added 8 lines, removed 2 lines
+      350  
+      351  
+      352  def open_door(door, motion, start, dur, rng, n_home):
+      353 -    """Door open for `dur` minutes with hallway motion before,
+          - during and (if someone is home) after."""                    
+      353 +    """Door open for `dur` minutes with hallway motion during 
+          +it.                                                           
+      354 +                                                              
+      355 +    Motion before opening only if someone was already inside (
+          +not on arrival to an empty house);                            
+      356 +    motion after closing only if someone is inside afterwards.
+      357 +    """                                                       
+      358      k_before = randint(rng, cfg.OCCUPANCY["motion_around_door"
+           ])
+      359      k_after = randint(rng, cfg.OCCUPANCY["motion_around_door"]
+           )
+      360      end = start + dur
+      361      door[start:end] = 1
+      358 -    motion[max(start - k_before, 0):end] = 1                  
+      362 +    motion[start:end] = 1                                     
+      363 +    if start > 0 and n_home[start - 1] > 0:                   
+      364 +        motion[max(start - k_before, 0):start] = 1            
+      365      if end < len(n_home) and n_home[end] > 0:
+      366          motion[end:end + k_after] = 1
+      367  
+
+● Update(generate_data.py)
+  ⎿  Added 1 line, removed 1 line
+      405          elif atype == "fridge_power_loss":
+      406              readings[cfg.POWER][s:e] = np.clip(mag + rng.norma
+           l(0, 0.05, e - s), 0, None)
+      407          elif atype == "compressor_stuck_on":
+      408 -            readings[cfg.POWER][s:e] = mag + rng.normal(0, cfg
+          -.FRIDGE["noise_sd"], e - s)                                   
+      408 +            readings[cfg.POWER][s:e] = mag + rng.normal(0, cfg
+          +.FRIDGE["noise_sd_on"], e - s)                                
+      409          elif atype == "intrusion_motion":
+      410              moves = (rng.random(e - s) < mag).astype(int)
+      411              moves[0] = 1  # the intruder is seen at least once
+            at the start
+
+● Next, #6: keep room for the recovery when placing heating failures, then
+  extend their labels to cover it.
+
+● Update(generate_data.py)
+  ⎿  Added 8 lines, removed 5 lines
+      148                      and clear(self.other_spans, cfg.RESERVED_B
+           UFFER_MINUTES))
+      149          return clear(self.anomaly_spans + self.other_spans, cf
+           g.RESERVED_BUFFER_MINUTES)
+      150  
+      151 -    def place(self, allowed, lo, hi, dur, is_anomaly, tries=50
+          -00):                                                          
+      152 -        """Random span of `dur` minutes inside [lo, hi) where 
+          -`allowed` holds throughout."""                                
+      153 -        candidates = np.flatnonzero(allowed[lo:hi - dur]) + lo
+      151 +    def place(self, allowed, lo, hi, dur, is_anomaly, reserve_
+          +after=0, tries=5000):                                         
+      152 +        """Random span of `dur` minutes inside [lo, hi) where 
+          +`allowed` holds throughout.                                   
+      153 +                                                              
+      154 +        reserve_after: extra minutes kept free after the span 
+          +(e.g. heating recovery).                                      
+      155 +        """                                                   
+      156 +        candidates = np.flatnonzero(allowed[lo:hi - dur - rese
+          +rve_after]) + lo                                              
+      157          for _ in range(tries):
+      158              start = int(self.rng.choice(candidates))
+      159              end = start + dur
+      157 -            if allowed[start:end].all() and self._is_free(star
+          -t, end, is_anomaly):                                          
+      158 -                (self.anomaly_spans if is_anomaly else self.ot
+          -her_spans).append((start, end))                               
+      160 +            if allowed[start:end].all() and self._is_free(star
+          +t, end + reserve_after, is_anomaly):                          
+      161 +                (self.anomaly_spans if is_anomaly else self.ot
+          +her_spans).append((start, end + reserve_after))               
+      162                  return start, end
+      163          raise RuntimeError(f"Could not place a {dur}-minute sp
+           an in [{lo}, {hi})")
+      164  
+
+● Update(generate_data.py)
+  ⎿  Added 2 lines, removed 1 line
+      258      anomalies = []
+      259      for split, (lo, hi) in bounds.items():
+      260          for atype in order:
+      261 +            reserve = cfg.ANOMALIES[atype].get("recovery_reser
+          +ve_minutes", 0)                                               
+      262              for _ in range(cfg.ANOMALY_COUNTS[split]):
+      263                  dur, magnitude = sample_anomaly_shape(atype, p
+           lanner.rng)
+      263 -                s, e = planner.place(masks[atype], lo, hi, dur
+          -, is_anomaly=True)                                            
+      264 +                s, e = planner.place(masks[atype], lo, hi, dur
+          +, is_anomaly=True, reserve_after=reserve)                     
+      265                  anomalies.append({"anomaly_type": atype, "sens
+           or_id": cfg.ANOMALIES[atype]["sensor"],
+      266                                    "start": s, "end": e, "magni
+           tude": magnitude,
+      267                                    "magnitude_unit": cfg.ANOMAL
+           IES[atype]["unit"], "split": split})
+
+● Update(generate_data.py)
+  ⎿  Added 21 lines
+      427      return rate
+      428  
+      429  
+      430 +def extend_heating_labels(anomalies, temp_failed, temp_normal)
+          +:                                                             
+      431 +    """Extend each heating-failure label through the recovery.
+      432 +                                                              
+      433 +    The label ends at the first minute where the noise-free se
+          +ries is back within                                           
+      434 +    `recovery_tolerance` of the no-failure series (capped at t
+          +he reserved recovery time).                                   
+      435 +    """                                                       
+      436 +    spec = cfg.ANOMALIES["heating_failure"]                   
+      437 +    for a in anomalies:                                       
+      438 +        if a["anomaly_type"] != "heating_failure":            
+      439 +            continue                                          
+      440 +        e = a["end"]                                          
+      441 +        gap = np.abs(temp_failed[e:e + spec["recovery_reserve_
+          +minutes"]]                                                    
+      442 +                     - temp_normal[e:e + spec["recovery_reserv
+          +e_minutes"]])                                                 
+      443 +        recovered = np.flatnonzero(gap <= spec["recovery_toler
+          +ance"])                                                       
+      444 +        if len(recovered) == 0:                               
+      445 +            print(f"  warning: heating failure at minute {a['s
+          +tart']} not recovered within reserve")                        
+      446 +            a["end"] = e + spec["recovery_reserve_minutes"]   
+      447 +        else:                                                 
+      448 +            a["end"] = e + int(recovered[0])                  
+      449 +                                                              
+      450 +                                                              
+      451  # ============================================================
+      452  # 6. Data-quality issues
+      453  # ============================================================
+
+● Update(generate_data.py)
+  ⎿  Added 8 lines, removed 2 lines
+      576      masks = anomaly_allowed_masks(index, occupancy, target, do
+           or_trips)
+      577      anomalies = plan_anomalies(planner, bounds, masks)
+      578  
+      579 -    # Normal behaviour (heating failure lives inside the tempe
+          -rature physics)                                               
+      579 +    # Temperature: noise-free with and without failures, then 
+          +label the recovery                                            
+      580 +    solar = solar_gain(tod)                                   
+      581 +    temp_failed = temperature_physics(target, solar, heating_f
+          +all_rate(anomalies, len(index)))                              
+      582 +    temp_normal = temperature_physics(target, solar, np.full(l
+          +en(index), np.nan))                                           
+      583 +    extend_heating_labels(anomalies, temp_failed, temp_normal)
+      584 +                                                              
+      585 +    # Normal behaviour for the other sensors                  
+      586      motion, door = simulate_motion_and_door(tod, occupancy, do
+           or_trips, rng)
+      587      readings = {
+      582 -        cfg.TEMP: simulate_temperature(target, solar_gain(tod)
+          -, heating_fall_rate(anomalies, len(index)), rng),             
+      588 +        cfg.TEMP: add_sensor_noise(temp_failed, cfg.TEMPERATUR
+          +E["noise_sd"], rng),                                          
+      589          cfg.POWER: simulate_fridge(tod, n_home, rng),
+      590          cfg.MOTION: motion.astype(float),
+      591          cfg.DOOR: door.astype(float),
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      generate_data.py && .venv/Scripts/python "$TMP/verify.py")
+  ⎿    warning: heating failure at minute 16977 not recovered within reserv
+     e
+       warning: heating failure at minute 6530 not recovered within reserve
+     … +37 lines (ctrl+o to expand)
+  ⎿  Updated data\anomaly_labels.csv (+48 -48)
+       1  anomaly_id,anomaly_type,sensor_id,start,end,magnitude,magnitude
+          _unit,split
+       2 -A001,fridge_power_loss,power_fridge,2024-01-08 04:40,2024-01-08
+         - 05:41,0.07,W,train                                            
+       3 -A002,heating_failure,temp_living_room,2024-01-08 14:19,2024-01-
+         -08 17:16,0.63,degC_per_hour,train                              
+       4 -A003,compressor_stuck_on,power_fridge,2024-01-08 22:38,2024-01-
+         -08 23:51,103.68,W,train                                        
+       5 -A004,intrusion_motion,motion_hallway,2024-01-09 14:48,2024-01-0
+         -9 15:13,0.57,fraction_of_minutes,train                         
+       6 -A005,temp_spike,temp_living_room,2024-01-10 19:07,2024-01-10 19
+         -:08,6.47,degC,train                                            
+       7 -A006,intrusion_motion,motion_hallway,2024-01-11 13:40,2024-01-1
+         -1 13:51,0.6,fraction_of_minutes,train                          
+       8 -A007,temp_spike,temp_living_room,2024-01-12 03:37,2024-01-12 03
+         -:37,3.61,degC,train                                            
+       9 -A008,fridge_power_loss,power_fridge,2024-01-12 11:17,2024-01-12
+         - 12:24,0.39,W,train                                            
+      10 -A009,compressor_stuck_on,power_fridge,2024-01-13 02:57,2024-01-
+         -13 04:05,105.38,W,train                                        
+      11 -A010,door_left_open,door_front,2024-01-13 18:47,2024-01-13 19:4
+         -1,55.0,min,train                                               
+      12 -A011,door_open_night,door_front,2024-01-14 03:04,2024-01-14 03:
+         -06,3.0,min,train                                               
+      13 -A012,heating_failure,temp_living_room,2024-01-14 16:06,2024-01-
+         -14 18:57,0.69,degC_per_hour,train                              
+      14 -A013,heating_failure,temp_living_room,2024-01-15 09:00,2024-01-
+         -15 11:57,0.66,degC_per_hour,train                              
+      15 -A014,compressor_stuck_on,power_fridge,2024-01-16 08:16,2024-01-
+         -16 10:07,105.89,W,train                                        
+      16 -A015,door_open_night,door_front,2024-01-17 01:41,2024-01-17 01:
+         -42,2.0,min,train                                               
+      17 -A016,door_open_night,door_front,2024-01-18 04:08,2024-01-18 04:
+         -09,2.0,min,train                                               
+      18 -A017,temp_spike,temp_living_room,2024-01-18 08:15,2024-01-18 08
+         -:17,6.58,degC,train                                            
+      19 -A018,intrusion_motion,motion_hallway,2024-01-18 11:28,2024-01-1
+         -8 11:35,0.52,fraction_of_minutes,train                         
+      20 -A019,door_left_open,door_front,2024-01-19 12:37,2024-01-19 14:0
+         -0,84.0,min,train                                               
+      21 -A020,fridge_power_loss,power_fridge,2024-01-21 00:40,2024-01-21
+         - 02:01,0.07,W,train                                            
+      22 -A021,door_left_open,door_front,2024-01-21 11:49,2024-01-21 12:4
+         -1,53.0,min,train                                               
+      23 -A022,door_open_night,door_front,2024-01-22 01:16,2024-01-22 01:
+         -18,3.0,min,val                                                 
+      24 -A023,heating_failure,temp_living_room,2024-01-22 17:57,2024-01-
+         -22 20:21,0.7,degC_per_hour,val                                 
+      25 -A024,intrusion_motion,motion_hallway,2024-01-23 16:00,2024-01-2
+         -3 16:17,0.58,fraction_of_minutes,val                           
+      26 -A025,fridge_power_loss,power_fridge,2024-01-24 00:09,2024-01-24
+         - 00:54,0.05,W,val                                              
+      27 -A026,fridge_power_loss,power_fridge,2024-01-24 07:34,2024-01-24
+         - 09:17,0.12,W,val                                              
+      28 -A027,temp_spike,temp_living_room,2024-01-24 14:50,2024-01-24 14
+         -:52,5.06,degC,val                                              
+      29 -A028,door_open_night,door_front,2024-01-25 04:29,2024-01-25 04:
+         -31,3.0,min,val                                                 
+      30 -A029,intrusion_motion,motion_hallway,2024-01-25 16:26,2024-01-2
+         -5 16:42,0.5,fraction_of_minutes,val                            
+      31 -A030,compressor_stuck_on,power_fridge,2024-01-27 02:52,2024-01-
+         -27 04:26,127.99,W,val                                          
+      32 -A031,door_left_open,door_front,2024-01-27 08:49,2024-01-27 09:2
+         -7,39.0,min,val                                                 
+      33 -A032,compressor_stuck_on,power_fridge,2024-01-27 13:57,2024-01-
+         -27 15:24,123.54,W,val                                          
+       2 +A001,temp_spike,temp_living_room,2024-01-08 04:40,2024-01-08 04
+         +:41,3.72,degC,train                                            
+       3 +A002,compressor_stuck_on,power_fridge,2024-01-08 10:39,2024-01-
+         +08 12:34,107.23,W,train                                        
+       4 +A003,door_open_night,door_front,2024-01-09 03:18,2024-01-09 03:
+         +22,5.0,min,train                                               
+       5 +A004,intrusion_motion,motion_hallway,2024-01-09 11:07,2024-01-0
+         +9 11:24,0.43,fraction_of_minutes,train                         
+       6 +A005,intrusion_motion,motion_hallway,2024-01-09 13:30,2024-01-0
+         +9 13:59,0.57,fraction_of_minutes,train                         
+       7 +A006,compressor_stuck_on,power_fridge,2024-01-09 17:01,2024-01-
+         +09 18:49,104.6,W,train                                         
+       8 +A007,door_open_night,door_front,2024-01-11 01:04,2024-01-11 01:
+         +08,5.0,min,train                                               
+     … 58 more lines (ctrl+o to expand)
+  ⎿  Updated data\generation_log.csv (+6 -6)
+       3  sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+          n
+       4  night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+          04:53,train
+       5  sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+          ain
+       6 +duplicate_row,all,2024-01-13 03:41,2024-01-13 03:41,train      
+       7  night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+          01:37,train
+       8 +duplicate_row,all,2024-01-14 16:21,2024-01-14 16:21,train      
+       9  night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+          04:02,train
+      10  sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+          3,train
+      11  sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+          train
+      12  night_bathroom_trip,motion_hallway,2024-01-19 03:16,2024-01-19 
+          03:17,train
+      11 -duplicate_row,all,2024-01-20 02:24,2024-01-20 02:24,train      
+      13  night_bathroom_trip,motion_hallway,2024-01-20 03:11,2024-01-20 
+          03:11,train
+      13 -duplicate_row,all,2024-01-20 15:14,2024-01-20 15:14,train      
+      14  weekend_guests,motion_hallway;door_front,2024-01-20 20:01,2024-
+          01-20 23:06,train
+      15  hub_outage,all,2024-01-21 09:39,2024-01-21 10:04,train
+      16  night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+          04:03,val
+     ...
+      18  night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+          04:52,val
+      19  hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val
+      20  sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+          9,val
+      21 +duplicate_row,all,2024-01-25 23:48,2024-01-25 23:48,val        
+      22 +duplicate_row,all,2024-01-26 03:24,2024-01-26 03:24,val        
+      23  night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+          03:51,val
+      24  sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val
+      23 -duplicate_row,all,2024-01-26 22:07,2024-01-26 22:07,val        
+      25  sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+          l
+      25 -duplicate_row,all,2024-01-27 11:00,2024-01-27 11:00,val        
+      26  weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+          01-27 23:15,val
+      27 -duplicate_row,all,2024-01-29 16:33,2024-01-29 16:33,test       
+      27  sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+          7,test
+      28 +duplicate_row,all,2024-01-30 04:47,2024-01-30 04:47,test       
+      29 +duplicate_row,all,2024-01-30 23:00,2024-01-30 23:00,test       
+      30  hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test
+      31  sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+          st
+      31 -duplicate_row,all,2024-02-01 20:59,2024-02-01 20:59,test       
+      32  night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+          03:27,test
+      33  night_bathroom_trip,motion_hallway,2024-02-03 01:21,2024-02-03 
+          01:23,test
+      34  night_bathroom_trip,motion_hallway,2024-02-03 02:31,2024-02-03 
+          02:34,test
+  ⎿  … 3 more files changed
+
+● Two heating failures didn't recover in time because they ended right before
+  the night setback, so heating never kicked back in to restore normal
+  temperature. I'll fix this by requiring the 21 °C target to hold through both
+  the failure and the recovery window.
+
+● Update(generate_data.py)
+  ⎿  Added 6 lines, removed 1 line
+      221      near_door_trip[door_trips] = True
+      222      near_door_trip = dilate(near_door_trip, 15)
+      223  
+      224 +    # Heating failure: target must stay at 21 degC for the fai
+          +lure AND the recovery after it                                
+      225 +    heating_on = pd.Series(target == cfg.TEMPERATURE["target_h
+          +ome"])                                                        
+      226 +    reserve = cfg.ANOMALIES["heating_failure"]["recovery_reser
+          +ve_minutes"]                                                  
+      227 +    heating_on_ahead = heating_on[::-1].rolling(reserve + 1, m
+          +in_periods=1).min()[::-1].to_numpy() > 0                      
+      228 +                                                              
+      229      return {
+      230          "temp_spike": anywhere,
+      226 -        "heating_failure": target == cfg.TEMPERATURE["target_h
+          -ome"],                                                        
+      231 +        "heating_failure": heating_on_ahead,                  
+      232          "fridge_power_loss": anywhere,
+      233          "compressor_stuck_on": anywhere,
+      234          "intrusion_motion": erode(empty, margin),
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      generate_data.py | sed -n '1,3p;/Anomalous/,/^$/p' && cat >
+      "$TMP/verify2.py" <<'EOF'
+      imp…)
+  ⎿  Rows per split:
+       train: 20,136
+     Anomalous minutes (% of split minutes, per sensor):
+     … +92 lines (ctrl+o to expand)
+  ⎿  Updated data\anomaly_labels.csv (+44 -44)
+       1  anomaly_id,anomaly_type,sensor_id,start,end,magnitude,magnitude
+          _unit,split
+       2 -A001,temp_spike,temp_living_room,2024-01-08 04:40,2024-01-08 04
+         -:41,3.72,degC,train                                            
+       3 -A002,compressor_stuck_on,power_fridge,2024-01-08 10:39,2024-01-
+         -08 12:34,107.23,W,train                                        
+       4 -A003,door_open_night,door_front,2024-01-09 03:18,2024-01-09 03:
+         -22,5.0,min,train                                               
+       5 -A004,intrusion_motion,motion_hallway,2024-01-09 11:07,2024-01-0
+         -9 11:24,0.43,fraction_of_minutes,train                         
+       6 -A005,intrusion_motion,motion_hallway,2024-01-09 13:30,2024-01-0
+         -9 13:59,0.57,fraction_of_minutes,train                         
+       7 -A006,compressor_stuck_on,power_fridge,2024-01-09 17:01,2024-01-
+         -09 18:49,104.6,W,train                                         
+       8 -A007,door_open_night,door_front,2024-01-11 01:04,2024-01-11 01:
+         -08,5.0,min,train                                               
+       9 -A008,compressor_stuck_on,power_fridge,2024-01-11 15:54,2024-01-
+         -11 16:58,122.4,W,train                                         
+      10 -A009,heating_failure,temp_living_room,2024-01-12 12:50,2024-01-
+         -12 18:00,0.65,degC_per_hour,train                              
+       2 +A001,compressor_stuck_on,power_fridge,2024-01-08 22:38,2024-01-
+         +08 23:51,103.68,W,train                                        
+       3 +A002,door_open_night,door_front,2024-01-09 03:18,2024-01-09 03:
+         +22,5.0,min,train                                               
+       4 +A003,intrusion_motion,motion_hallway,2024-01-09 13:30,2024-01-0
+         +9 13:59,0.57,fraction_of_minutes,train                         
+       5 +A004,temp_spike,temp_living_room,2024-01-09 20:17,2024-01-09 20
+         +:17,-4.15,degC,train                                           
+       6 +A005,door_open_night,door_front,2024-01-11 01:04,2024-01-11 01:
+         +08,5.0,min,train                                               
+       7 +A006,fridge_power_loss,power_fridge,2024-01-11 21:44,2024-01-11
+         + 23:33,0.1,W,train                                             
+       8 +A007,temp_spike,temp_living_room,2024-01-12 03:37,2024-01-12 03
+         +:37,3.61,degC,train                                            
+       9 +A008,fridge_power_loss,power_fridge,2024-01-12 07:44,2024-01-12
+         + 09:26,0.49,W,train                                            
+      10 +A009,fridge_power_loss,power_fridge,2024-01-13 03:02,2024-01-13
+         + 03:57,0.09,W,train                                            
+      11  A010,door_left_open,door_front,2024-01-13 08:53,2024-01-13 09:3
+          3,41.0,min,train
+      12 -A011,door_left_open,door_front,2024-01-13 18:49,2024-01-13 19:2
+         -4,36.0,min,train                                               
+      13 -A012,heating_failure,temp_living_room,2024-01-14 14:57,2024-01-
+         -14 19:42,0.69,degC_per_hour,train                              
+      14 -A013,fridge_power_loss,power_fridge,2024-01-14 22:54,2024-01-15
+         - 00:36,0.49,W,train                                            
+      15 -A014,temp_spike,temp_living_room,2024-01-17 11:40,2024-01-17 11
+         -:40,-3.66,degC,train                                           
+      16 -A015,temp_spike,temp_living_room,2024-01-17 17:14,2024-01-17 17
+         -:16,-5.53,degC,train                                           
+      17 -A016,door_left_open,door_front,2024-01-17 21:12,2024-01-17 21:3
+         -1,20.0,min,train                                               
+      18 -A017,fridge_power_loss,power_fridge,2024-01-18 01:11,2024-01-18
+         - 02:08,0.3,W,train                                             
+      19 -A018,intrusion_motion,motion_hallway,2024-01-18 13:46,2024-01-1
+         -8 14:15,0.35,fraction_of_minutes,train                         
+      20 -A019,door_open_night,door_front,2024-01-19 04:16,2024-01-19 04:
+         -19,4.0,min,train                                               
+      21 -A020,heating_failure,temp_living_room,2024-01-19 18:57,2024-01-
+         -20 00:24,0.66,degC_per_hour,train                              
+      22 -A021,fridge_power_loss,power_fridge,2024-01-20 04:59,2024-01-20
+         - 05:57,0.16,W,train                                            
+      23 -A022,heating_failure,temp_living_room,2024-01-22 17:29,2024-01-
+         -22 21:55,0.86,degC_per_hour,val                                
+      24 -A023,compressor_stuck_on,power_fridge,2024-01-23 06:13,2024-01-
+         -23 07:37,128.99,W,val                                          
+      25 -A024,intrusion_motion,motion_hallway,2024-01-23 11:49,2024-01-2
+         -3 12:04,0.58,fraction_of_minutes,val                           
+      26 -A025,door_open_night,door_front,2024-01-24 01:22,2024-01-24 01:
+         -25,4.0,min,val                                                 
+      27 -A026,temp_spike,temp_living_room,2024-01-24 08:08,2024-01-24 08
+         -:08,4.16,degC,val                                              
+      28 -A027,intrusion_motion,motion_hallway,2024-01-24 10:49,2024-01-2
+         -4 10:55,0.39,fraction_of_minutes,val                           
+      29 -A028,door_open_night,door_front,2024-01-25 03:00,2024-01-25 03:
+         -00,1.0,min,val                                                 
+      30 -A029,fridge_power_loss,power_fridge,2024-01-26 09:27,2024-01-26
+         - 11:11,0.23,W,val                                              
+      31 -A030,door_left_open,door_front,2024-01-26 14:01,2024-01-26 14:5
+         -7,57.0,min,val                                                 
+     … 54 more lines (ctrl+o to expand)
+  ⎿  Updated data\generation_log.csv (+6 -6)
+       1  kind,sensor_id,start,end,split
+       2  night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+          02:13,train
+       3 +duplicate_row,all,2024-01-08 03:40,2024-01-08 03:40,train      
+       4  sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+          n
+       5  night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+          04:53,train
+       6  sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+          ain
+       6 -duplicate_row,all,2024-01-13 03:41,2024-01-13 03:41,train      
+       7  night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+          01:37,train
+       8 -duplicate_row,all,2024-01-14 16:21,2024-01-14 16:21,train      
+       8 +duplicate_row,all,2024-01-14 15:28,2024-01-14 15:28,train      
+       9  night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+          04:02,train
+      10  sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+          3,train
+      11  sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+          train
+     ...
+      16  night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+          04:03,val
+      17  sensor_outage,motion_hallway,2024-01-22 13:52,2024-01-22 14:08,
+          val
+      18  night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+          04:52,val
+      19 +duplicate_row,all,2024-01-25 01:15,2024-01-25 01:15,val        
+      20  hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val
+      21  sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+          9,val
+      21 -duplicate_row,all,2024-01-25 23:48,2024-01-25 23:48,val        
+      22 -duplicate_row,all,2024-01-26 03:24,2024-01-26 03:24,val        
+      22  night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+          03:51,val
+      23 +duplicate_row,all,2024-01-26 07:35,2024-01-26 07:35,val        
+      24  sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val
+      25  sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+          l
+      26  weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+          01-27 23:15,val
+      27  sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+          7,test
+      28 -duplicate_row,all,2024-01-30 04:47,2024-01-30 04:47,test       
+      29 -duplicate_row,all,2024-01-30 23:00,2024-01-30 23:00,test       
+      28 +duplicate_row,all,2024-01-30 03:04,2024-01-30 03:04,test       
+      29 +duplicate_row,all,2024-01-31 11:52,2024-01-31 11:52,test       
+      30  hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test
+      31  sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+          st
+      32  night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+          03:27,test
+  ⎿  … 3 more files changed
+
+● I've applied all the fixes and checked them against the regenerated data. One
+  new issue showed up in the detailed check; it's flagged after the tables.
+  First I'll update design.md.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 4 lines, removed 3 lines
+      107    - So "house empty" only occurs on Tue–Thu daytime.
+      108  - **Indoor temperature:**
+      109    - Thermostat targets 21 °C while awake and home, 18 °C at ni
+           ght, and 18 °C eco mode while the house is empty (Tue–Thu dayt
+           ime).
+      110 -  - Room temperature follows the target with a first-order lag
+          - (~30–60 min).                                                
+      110 +  - Room temperature follows the target with a first-order lag
+          +: **45 min when heating, 300 min when cooling**. Normal night 
+          +cooling is ~0.4 °C/h (measured), slower than any heating failu
+          +re.                                                           
+      111    - Afternoon solar gain of ~+0.5 °C, sensor noise ~0.1 °C.
+      112  - **Fridge power:**
+      113    - Compressor 100–130 W for 12–18 min, idle 2–5 W for 18–30 m
+           in (~40% duty).
+      114 +  - Noise depends on state: ±2 W when running or defrosting, ±
+          +0.3 W at idle. Idle never reads near 0 W (measured minimum 1.1
+          + W), so it cannot be confused with a power loss.              
+      115    - Defrost every ~10 h, ~20 min at ~300 W (normal, but the hi
+           ghest reading).
+      116    - Runs ~20% longer at mealtimes when someone is home.
+      117  - **Hallway motion:**
+      117 -  - Per-minute probability: ~0.10–0.30 awake and home (morning
+          -/evening peaks), ~0.005 asleep, 0 when away.                  
+      118 -  - Always motion just before the door opens and just after it
+          - closes.                                                      
+      118 +  - Per-minute probability: ~0.10–0.30 awake and home (morning
+          +/evening peaks), ~0.005 asleep, **0.001 when away** (stray sen
+          +sor triggers, ~0.5 per empty day).                            
+      119 +  - Motion while the door is open. Motion **before** opening o
+          +nly if someone was already inside (never on arrival to an empt
+          +y house). Motion after closing only if someone is inside.     
+      120  - **Front door:**
+      121    - Opens 1–3 min at each departure or arrival.
+      122    - 0–2 extra openings per day when someone is home.
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      127  | Type | When allowed | Duration | Magnitude (unit) |
+      128  |---|---|---|---|
+      129  | `temp_spike` | Any time | 1–3 min | ±3–8 (°C jump, random si
+           gn) |
+      130 -| `heating_failure` | Entire window inside a 21 °C target peri
+          -od | 1.5–3 h | Fall rate 0.5–1.0 °C/h, **total drop ≥ 1.5 °C**
+          -, then normal recovery |                                      
+      130 +| `heating_failure` | 21 °C target throughout the failure **an
+          +d** the 150-min recovery reserve | 1.5–3 h fall + recovery | F
+          +all rate 0.5–1.0 °C/h, **total drop ≥ 1.5 °C**. Label covers t
+          +he recovery too |                                             
+      131  | `fridge_power_loss` | Any time | 45–120 min | Power reads 0–
+           0.5 W |
+      132  | `compressor_stuck_on` | Any time | 1–2 h | Constant 100–130 
+           W (normal run ≤ 18 min) |
+      133  | `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+            min | Share of minutes with motion 0.3–0.6, no door opening |
+
+● Update(docs\design.md)
+  ⎿  Added 10 lines, removed 5 lines
+      132  | `compressor_stuck_on` | Any time | 1–2 h | Constant 100–130 
+           W (normal run ≤ 18 min) |
+      133  | `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+            min | Share of minutes with motion 0.3–0.6, no door opening |
+      134  | `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, wi
+           th hallway motion around it |
+      135 -| `door_left_open` | Awake and home | 30–90 min | Minutes open
+          - (normal 1–3 min) |                                           
+      135 +| `door_left_open` | Awake and home | 20–60 min | Minutes open
+          + (normal 1–3 min) |                                           
+      136  
+      137  - **Heating failure ≥ 1.5 °C:** sample the fall rate first, th
+           en the duration from [max(1.5 h, 1.5 / rate), 3 h]. At the low
+           est rate this forces a 3 h failure.
+      138 -- **Durations shortened after the first generation:** the orig
+          -inal ranges (heating 2–5 h, power loss 1–4 h, stuck-on 2–4 h) 
+          -gave 10.4–12.6% anomalous minutes per split. The shorter range
+          -s give the following (measured, seed 42):                     
+      138 +- **Heating-failure label includes recovery:** the label ends 
+          +at the first minute where the noise-free temperature is back w
+          +ithin 0.3 °C of a noise-free run without the failure. Alerts d
+          +uring recovery are correct detections, not false alarms. The n
+          +oise-free physics is run twice; noise is added once afterwards
+          +, so the random stream is not disturbed.                      
+      139 +- **Duration history:**                                       
+      140 +  - The original ranges (heating 2–5 h, power loss 1–4 h, stuc
+          +k-on 2–4 h, door left open 30–90 min) gave 10.4–12.6% anomalou
+          +s minutes per split.                                          
+      141 +  - Shortened ranges plus the reviewer fixes (cooling lag, lab
+          +elled recovery) give the following (measured, seed 42):       
+      142  
+      143    | Split | Temp | Fridge | Motion | Door | Any sensor |
+      144    |---|---|---|---|---|---|
+      142 -  | Train | 2.65% | 2.32% | 0.23% | 0.99% | 6.18% |           
+      143 -  | Val | 3.10% | 3.30% | 0.35% | 1.25% | 8.00% |             
+      144 -  | Test | 3.03% | 2.30% | 0.37% | 0.99% | 6.69% |            
+      145 +  | Train | 3.99% | 2.48% | 0.32% | 0.54% | 7.33% |           
+      146 +  | Val | 4.91% | 3.46% | 0.37% | 1.10% | 9.84% |             
+      147 +  | Test | 5.24% | 2.56% | 0.37% | 0.99% | 9.16% |            
+      148 +                                                              
+      149 +  - Temperature rose again because the heating labels now incl
+          +ude recovery (~4–5 h per failure).                            
+      150  - **Placement:**
+      151    - No overlap between anomalies, with a gap of at least 2 h.
+      152    - Anomalies never overlap benign events or outages, so each 
+           label stays unambiguous.
+
+● I've applied all six reviewer fixes, regenerated the data and updated
+  design.md. Every number below comes from the regenerated data, with seed 42.
+
+  How each fix checks out
+
+  #: 1
+  Fix: Fridge idle noise reduced to ±0.3 W
+  Before: 8.9% of idle minutes read ≤ 0.5 W
+  After: 0%. Idle readings are now never below 1.1 W.
+  ────────────────────────────────────────
+  #: 2
+  Fix: Separate lags: 45 min heating, 300 min cooling
+  Before: Normal night cooling ~2.0 °C in the first hour
+  After: ~0.4 °C/h. Every heating failure (0.65–0.93 °C/h) now falls faster than
+
+  a normal night.
+  ────────────────────────────────────────
+  #: 3
+  Fix: door_left_open shortened to 20–60 min
+  Before: 30–90 min
+  After: Door anomalous minutes are 0.5–1.1% of each split
+  ────────────────────────────────────────
+  #: 4
+  Fix: No motion before an arrival to an empty house
+  Before: 26 arrivals with motion before the door opened
+  After: 0 of 10 arrivals
+  ────────────────────────────────────────
+  #: 5
+  Fix: Stray motion while away, 0.001 per minute
+  Before: 0
+  After: 7 stray minutes over 12 empty days
+  ────────────────────────────────────────
+  #: 6
+  Fix: Heating-failure labels cover the recovery
+  Before: Room still cold for up to 2 h after the label ended
+  After: Labels last 238–285 min in total (fall plus recovery)
+
+  Extra fix for #6: two failures never recovered, because they ended right
+  before the night setback, when the heating stays off. A heating failure is now
+  only placed where the 21 °C target lasts through both the failure and a
+  150-min recovery window.
+
+  All anomalies by type and sensor
+
+  Type: temp_spike
+  Sensor: temp
+  When it occurs: Any time
+  Label duration: 1–3 min
+  Magnitude: ±3.6–7.0 °C
+  What the data shows: Readings of 13.8–26.2 °C, against a normal 18–21 °C
+  ────────────────────────────────────────
+  Type: heating_failure
+  Sensor: temp
+  When it occurs: 21 °C target periods only (Mon, Fri, weekends)
+  Label duration: 238–285 min, fall plus recovery
+  Magnitude: 0.65–0.93 °C/h
+  What the data shows: Drops of 1.8–2.4 °C (for example 21.4 → 19.3 °C)
+  ────────────────────────────────────────
+  Type: fridge_power_loss
+  Sensor: fridge
+  When it occurs: Any time
+  Label duration: 53–117 min
+  Magnitude: 0.0–0.5 W
+  What the data shows: Average 0.0–0.5 W, where normal idle is about 3.5 W
+  ────────────────────────────────────────
+  Type: compressor_stuck_on
+  Sensor: fridge
+  When it occurs: Any time
+  Label duration: 61–82 min
+  Magnitude: 103–128 W
+  What the data shows: Constant power, against a normal run of at most 18 min
+  ────────────────────────────────────────
+  Type: intrusion_motion
+  Sensor: motion
+  When it occurs: Tue–Thu, house empty, 10:17–16:53
+  Label duration: 6–30 min
+  Magnitude: 0.34–0.57 of minutes
+  What the data shows: 2–13 motion minutes, and the door never opens
+  ────────────────────────────────────────
+  Type: door_open_night
+  Sensor: door
+  When it occurs: 01:04–04:39
+  Label duration: 2–5 min
+  Magnitude: 2–5 min
+  What the data shows: Door open with hallway motion
+  ────────────────────────────────────────
+  Type: door_left_open
+  Sensor: door
+  When it occurs: Awake and home
+  Label duration: 20–59 min
+  Magnitude: 20–59 min
+  What the data shows: Door open, against a normal 1–3 min
+
+  Counts are 3/2/2 per type in train/val/test (49 anomalies in total). The full
+  list of individual anomalies is in data/anomaly_labels.csv.
+
+  Anomalous minutes overall: 7.3% (train), 9.8% (val), 9.2% (test). Temperature
+  now accounts for 4.0–5.2%, because the heating labels include recovery.
+
+  A new issue I found (medium priority, not fixed yet)
+
+  door_left_open has hallway motion in every minute the door is open, so a
+  41-min opening shows 41 motion minutes. That's unrealistic: someone walks
+  through once, not for 40 minutes. It also makes this anomaly show up on the
+  motion sensor, which will confuse the "correct sensor" metric. The cause is my
+  #4 change, which adds motion for the whole time the door is open; before, the
+  motion was spread over the opening in the same way.
+
+  Proposed fix: add motion only in the first and last minute of an opening
+  (walking through, then closing it). Routine 1–3 min openings look the same as
+  now.
+
+  Questions:
+  1. Should I apply this motion fix?
+  2. Overall anomalous minutes are 7–10%. Are you happy with that? If not, the
+     next lever is a shorter heating failure, for example 1–2 h at 0.75–1.5
+     °C/h. That cuts the temperature rate without dropping below the 1.5 °C
+     minimum.
+
+✻ Baked for 2m 17s · done Friday 9:21 PM
+
+※ recap: We're building the smart-home anomaly-detection take-home and are at Stage 3, generating the data, with all six reviewer fixes applied and the data regenerated. Next, you decide whether I should fix the constant motion while the door is left open, and whether 7–10% anomalous minutes is acceptable. (disable recaps in /config)
+
+❯ 1.Apply the motion fix with the first and last minute of opening. 2 The rates 
+  look fine. Update design.md if we change something and rerun the checks once  
+  and give me the final numbers before we move on.                              
+
+● Update(generate_data.py)
+  ⎿  Added 3 lines, removed 2 lines
+      359  
+      360  
+      361  def open_door(door, motion, start, dur, rng, n_home):
+      362 -    """Door open for `dur` minutes with hallway motion during 
+          -it.                                                           
+      362 +    """Door open for `dur` minutes with hallway motion in its 
+          +first and last minute (walk through, close).                  
+      363  
+      364      Motion before opening only if someone was already inside (
+           not on arrival to an empty house);
+      365      motion after closing only if someone is inside afterwards.
+     ...
+      368      k_after = randint(rng, cfg.OCCUPANCY["motion_around_door"]
+           )
+      369      end = start + dur
+      370      door[start:end] = 1
+      371 -    motion[start:end] = 1                                     
+      371 +    motion[start] = 1                                         
+      372 +    motion[end - 1] = 1                                       
+      373      if start > 0 and n_home[start - 1] > 0:
+      374          motion[max(start - k_before, 0):start] = 1
+      375      if end < len(n_home) and n_home[end] > 0:
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      116    - Runs ~20% longer at mealtimes when someone is home.
+      117  - **Hallway motion:**
+      118    - Per-minute probability: ~0.10–0.30 awake and home (morning
+           /evening peaks), ~0.005 asleep, **0.001 when away** (stray sen
+           sor triggers, ~0.5 per empty day).
+      119 -  - Motion while the door is open. Motion **before** opening o
+          -nly if someone was already inside (never on arrival to an empt
+          -y house). Motion after closing only if someone is inside.     
+      119 +  - Motion in the **first and last minute** of every door open
+          +ing (walk through, close), not throughout. Motion **before** o
+          +pening only if someone was already inside (never on arrival to
+          + an empty house). Motion after closing only if someone is insi
+          +de.                                                           
+      120  - **Front door:**
+      121    - Opens 1–3 min at each departure or arrival.
+      122    - 0–2 extra openings per day when someone is home.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      generate_data.py && .venv/Scripts/python "$TMP/verify2.py" > "$TMP/v2.txt"
+      && sed -n '1,4…)
+  ⎿  Rows per split:
+       train: 20,136
+       val  : 10,042
+     … +64 lines (ctrl+o to expand)
+  ⎿  Updated data\test.csv (+77 -77)
+      228  2024-01-29 03:46,19.25,111.7,0,0
+      229  2024-01-29 03:47,19.07,111.5,1,0
+      230  2024-01-29 03:48,19.23,111.6,1,1
+      231 -2024-01-29 03:49,19.15,111.5,1,1                              
+      232 -2024-01-29 03:50,19.18,113.7,1,1                              
+      233 -2024-01-29 03:51,19.3,109.7,1,1                               
+      231 +2024-01-29 03:49,19.15,111.5,0,1                              
+      232 +2024-01-29 03:50,19.18,113.7,0,1                              
+      233 +2024-01-29 03:51,19.3,109.7,0,1                               
+      234  2024-01-29 03:52,19.23,111.5,1,1
+      235  2024-01-29 03:53,19.27,105.6,1,0
+      236  2024-01-29 03:54,19.23,107.4,0,0
+     ...
+      1874  2024-01-30 07:11,19.88,2.4,1,0
+      1875  2024-01-30 07:12,19.92,2.6,1,0
+      1876  2024-01-30 07:13,19.88,2.1,1,1
+      1877 -2024-01-30 07:14,20.03,2.2,1,1                               
+      1878 -2024-01-30 07:15,19.93,2.4,1,1                               
+      1879 -2024-01-30 07:16,20.03,2.5,1,1                               
+      1880 -2024-01-30 07:17,19.89,2.6,1,1                               
+      1877 +2024-01-30 07:14,20.03,2.2,0,1                               
+      1878 +2024-01-30 07:15,19.93,2.4,0,1                               
+      1879 +2024-01-30 07:16,20.03,2.5,0,1                               
+      1880 +2024-01-30 07:17,19.89,2.6,0,1                               
+      1881  2024-01-30 07:18,19.96,2.9,1,1
+      1882 -2024-01-30 07:19,20.15,2.4,1,1                               
+      1882 +2024-01-30 07:19,20.15,2.4,0,1                               
+      1883  2024-01-30 07:20,19.91,2.3,1,1
+      1884 -2024-01-30 07:21,20.18,2.9,1,1                               
+      1885 -2024-01-30 07:22,20.09,2.3,1,1                               
+      1886 -2024-01-30 07:23,19.94,104.3,1,1                             
+      1887 -2024-01-30 07:24,20.11,101.0,1,1                             
+      1884 +2024-01-30 07:21,20.18,2.9,0,1                               
+      1885 +2024-01-30 07:22,20.09,2.3,0,1                               
+      1886 +2024-01-30 07:23,19.94,104.3,0,1                             
+      1887 +2024-01-30 07:24,20.11,101.0,0,1                             
+      1888  2024-01-30 07:25,20.25,101.5,1,1
+      1889 -2024-01-30 07:26,20.43,106.2,1,1                             
+      1890 -2024-01-30 07:27,20.4,104.7,1,1                              
+      1891 -2024-01-30 07:28,20.14,104.0,1,1                             
+      1892 -2024-01-30 07:29,20.33,105.3,1,1                             
+     … 215 more lines (ctrl+o to expand)
+  ⎿  Updated data\train.csv (+101 -101)
+      662  2024-01-08 10:59,20.96,127.5,0,0
+      663  2024-01-08 11:00,21.12,128.3,1,0
+      664  2024-01-08 11:01,21.09,127.7,1,1
+      665 -2024-01-08 11:02,21.05,127.5,1,1                              
+      665 +2024-01-08 11:02,21.05,127.5,0,1                              
+      666  2024-01-08 11:03,20.88,131.2,1,1
+      667  2024-01-08 11:04,20.87,3.6,1,0
+      668  2024-01-08 11:05,21.11,3.8,0,0
+     ...
+      1639  2024-01-09 03:16,19.27,101.9,1,0
+      1640  2024-01-09 03:17,19.08,103.5,1,0
+      1641  2024-01-09 03:18,19.18,108.5,1,1
+      1642 -2024-01-09 03:19,19.18,101.4,1,1                             
+      1643 -2024-01-09 03:20,19.28,105.0,1,1                             
+      1644 -2024-01-09 03:21,19.15,2.8,1,1                               
+      1642 +2024-01-09 03:19,19.18,101.4,0,1                             
+      1643 +2024-01-09 03:20,19.28,105.0,0,1                             
+      1644 +2024-01-09 03:21,19.15,2.8,0,1                               
+      1645  2024-01-09 03:22,19.23,2.6,1,1
+      1646  2024-01-09 03:23,19.16,3.3,1,0
+      1647  2024-01-09 03:24,19.11,2.2,1,0
+     ...
+      1954  2024-01-09 08:31,20.74,4.6,0,0
+      1955  2024-01-09 08:32,20.8,4.6,1,0
+      1956  2024-01-09 08:33,20.79,4.7,1,1
+      1957 -2024-01-09 08:34,20.79,4.8,1,1                               
+      1957 +2024-01-09 08:34,20.79,4.8,0,1                               
+      1958  2024-01-09 08:35,20.65,4.7,1,1
+      1959  2024-01-09 08:36,20.87,4.7,0,0
+      1960  2024-01-09 08:37,20.76,5.1,0,0
+     ...
+      2781  2024-01-09 22:18,20.89,3.1,1,0
+      2782  2024-01-09 22:19,20.9,2.6,1,0
+      2783  2024-01-09 22:20,21.06,2.9,1,1
+      2784 -2024-01-09 22:21,20.95,3.2,1,1                               
+      2784 +2024-01-09 22:21,20.95,3.2,0,1                               
+      2785  2024-01-09 22:22,21.05,2.5,1,1
+      2786  2024-01-09 22:23,20.95,3.1,1,0
+      2787  2024-01-09 22:24,21.05,3.1,0,0
+     ...
+      4385  2024-01-11 01:02,19.99,3.1,0,0
+      4386  2024-01-11 01:03,19.86,2.6,1,0
+      4387  2024-01-11 01:04,19.92,106.5,1,1
+      4388 -2024-01-11 01:05,20.06,106.8,1,1                             
+     … 319 more lines (ctrl+o to expand)
+  ⎿  Updated data\val.csv (+79 -79)
+      501  2024-01-22 08:19,20.86,3.2,1,0
+      502  2024-01-22 08:20,20.69,3.7,1,0
+      503  2024-01-22 08:21,20.76,3.4,1,1
+      504 -2024-01-22 08:22,20.73,2.9,1,1                                
+      504 +2024-01-22 08:22,20.73,2.9,0,1                                
+      505  2024-01-22 08:23,20.8,2.9,1,1
+      506  2024-01-22 08:24,20.75,3.6,1,0
+      507  2024-01-22 08:25,20.82,2.7,0,0
+     ...
+      2702  2024-01-23 21:00,20.95,3.0,1,0
+      2703  2024-01-23 21:01,21.06,2.9,1,0
+      2704  2024-01-23 21:02,20.9,2.6,1,1
+      2705 -2024-01-23 21:03,20.99,105.4,1,1                             
+      2705 +2024-01-23 21:03,20.99,105.4,0,1                             
+      2706  2024-01-23 21:04,21.13,100.5,1,1
+      2707  2024-01-23 21:05,20.87,100.1,1,0
+      2708  2024-01-23 21:06,20.97,104.1,1,0
+     ...
+      3989  2024-01-24 18:27,20.09,3.5,1,0
+      3990  2024-01-24 18:28,20.08,3.2,1,0
+      3991  2024-01-24 18:29,20.15,3.3,1,1
+      3992 -2024-01-24 18:30,20.19,3.0,1,1                               
+      3992 +2024-01-24 18:30,20.19,3.0,0,1                               
+      3993  2024-01-24 18:31,20.26,3.7,1,1
+      3994  2024-01-24 18:32,20.27,3.3,1,0
+      3995  2024-01-24 18:33,20.04,3.9,0,0
+     ...
+      4130  2024-01-24 20:48,21.12,4.7,1,0
+      4131  2024-01-24 20:49,21.1,4.8,1,0
+      4132  2024-01-24 20:50,20.87,5.1,1,1
+      4133 -2024-01-24 20:51,20.88,4.6,1,1                               
+      4133 +2024-01-24 20:51,20.88,4.6,0,1                               
+      4134  2024-01-24 20:52,21.0,4.9,1,1
+      4135 -2024-01-24 20:53,20.88,4.7,1,1                               
+      4136 -2024-01-24 20:54,20.99,5.2,1,1                               
+      4135 +2024-01-24 20:53,20.88,4.7,0,1                               
+      4136 +2024-01-24 20:54,20.99,5.2,0,1                               
+      4137  2024-01-24 20:55,20.93,4.7,1,1
+      4138  2024-01-24 20:56,21.06,5.0,1,1
+      4139 -2024-01-24 20:57,21.06,4.5,1,1                               
+      4140 -2024-01-24 20:58,20.94,4.5,1,1                               
+      4141 -2024-01-24 20:59,20.79,4.4,1,1                               
+      4142 -2024-01-24 21:00,21.07,107.9,1,1                             
+     … 195 more lines (ctrl+o to expand)
+● Update(docs\design.md)
+  ⎿  Added 2 lines, removed 1 line
+      197  - **Anomaly definitions:** the 7 injected anomaly types with t
+           heir real-world meaning.
+      198  - **Assumptions:** household profile (two adults, hybrid WFH M
+           on/Fri, house empty only Tue–Thu daytime, one adult always hom
+           e at weekends), thermostat with night setback and eco mode, wi
+           nter heating season, no daylight-saving change.
+      199  - **Data quality:** outages and missing data are handled in cl
+           eaning, not scored as anomalies.
+      200 -- **Limitations:** with 2 anomalies per type in validation/tes
+          -t, per-type recall can only be 0%, 50% or 100%. Training conta
+          -ins unlabelled anomalies (contamination).                     
+      200 +- **Limitations:** with 2 anomalies per type in validation/tes
+          +t, per-type recall can only be 0%, 50% or 100%. Training conta
+          +ins unlabelled anomalies (contamination). Anomalous minutes ar
+          +e 7–10% per split, higher than a real home, mainly because hea
+          +ting-failure labels include the recovery.                     
+      201 +- **Synthetic data realism:** a reviewer pass fixed 6 issues p
+          +lus 1 follow-up: idle noise, cooling lag, durations, arrival m
+          +otion, stray motion, heating recovery labels, and door-motion 
+          +only at the first and last minute. Mention this as part of the
+          + process.                                                     
+      202  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      203  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+      204  - **Repo layout:** the tree and a one-line role for each file 
+           (Stage 2).
+
+● I've applied the door-motion fix, re-run the generator and all the checks, and
+  updated design.md.
+
+  Final numbers (seed 42)
+
+  Anomalous minutes, as a % of each split:
+
+  ┌───────┬────────┬──────┬────────┬────────┬──────┬────────────┐
+  │ Split │  Rows  │ Temp │ Fridge │ Motion │ Door │ Any sensor │
+  ├───────┼────────┼──────┼────────┼────────┼──────┼────────────┤
+  │ Train │ 20,136 │ 3.99 │ 2.48   │ 0.32   │ 0.54 │ 7.33       │
+  ├───────┼────────┼──────┼────────┼────────┼──────┼────────────┤
+  │ Val   │ 10,042 │ 4.91 │ 3.46   │ 0.37   │ 1.10 │ 9.84       │
+  ├───────┼────────┼──────┼────────┼────────┼──────┼────────────┤
+  │ Test  │ 10,049 │ 5.24 │ 2.56   │ 0.37   │ 0.99 │ 9.16       │
+  └───────┴────────┴──────┴────────┴────────┴──────┴────────────┘
+
+  These are the same as the previous run. The motion fix doesn't change any
+  labels, and because all randomness comes from the seed, every other value
+  regenerated identically.
+
+  Checks:
+  - Door motion fix: door_left_open now shows 5–19 motion minutes over a 20–59
+    min opening. That's the first and last minute plus normal household motion,
+    where before it was every minute. door_open_night shows exactly 2 motion
+    minutes.
+  - Reviewer fixes still hold:
+    - Fridge idle never reads below 1.1 W.
+    - Normal night cooling is 0.42 °C/h.
+    - No motion before arrivals to an empty house (0 of 10).
+    - 7 stray motion minutes over 12 empty days.
+  - Normal behaviour: fridge compressor on 41% of the time, 4.7 door openings
+    per day, evening motion 0.29 per minute.
+  - Counts: 3/2/2 per type. Each split has 1 hub outage, 4 sensor outages, 2
+    duplicate rows and 1 weekend-guests evening. The bathroom trips are 6/3/3.
+
+  Stage 3 summary (the six topics you asked for before EDA)
+
+  Topic: 1. Format
+  Decision: Wide CSV with one row per minute. 4 sensor IDs. Mon 2024-01-08 to
+  Sun
+  2024-02-04. Labels (with magnitude_unit) and the generation log are separate
+  files.
+  ────────────────────────────────────────
+  Topic: 2. Normal behaviour
+  Decision: 2 adults, WFH on Mon/Fri, house empty only Tue–Thu daytime.
+  Thermostat 21/18 °C with eco mode, 45/300-min heating/cooling lags. Fridge
+  cycles with defrost and state-dependent noise. Occupancy-driven motion,
+  including stray triggers.
+  ────────────────────────────────────────
+  Topic: 3. Anomalies
+  Decision: 7 types, 3/2/2 per split, randomised timing, duration and magnitude.
+
+  Heating labels include recovery. At least 2 h apart, never overlapping benign
+   events or outages.
+  ────────────────────────────────────────
+  Topic: 4. Benign events
+  Decision: Night bathroom trips (~3 per week) and one weekend-guests evening
+  per
+  split, unlabelled.
+  ────────────────────────────────────────
+  Topic: 5. Data quality
+  Decision: Per split: 1 outage per sensor, 1 hub outage (missing rows), 2
+  duplicate rows, ~0.1% dropped readings.
+  ────────────────────────────────────────
+  Topic: 6. Split
+  Decision: One continuous series cut into train.csv, val.csv and test.csv.
+  Nothing crosses a split boundary.
+
+  Before Stage 4: please export this session (/export) into ai_transcripts/.
+  Nothing is committed to git yet; tell me if you want a commit at this point.
+  Once you've approved Stage 3, we'll start Cleaning & EDA.
+
+✻ Sautéed for 32s · done Friday 9:34 PM
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: C:\Users\Gracy\Projects\Anomaly
+     Detection\002_synthetic_data_generation.txt
+
+❯ New findings:                                                                 
+  New findings                                                                  
+                                                                                
+  1. Medium: the shortest intrusions can look like a stray trigger (anomaly     
+  can't be identified)                                                          
+  - Reason: Intrusion motion is a coin flip per minute, with only the first     
+  minute forced. For a 5-min intrusion with share 0.3, about 24% of samples     
+  show a single motion minute. That's exactly what a stray trigger looks like   
+  now that away = 0.001. The share of motion minutes actually produced also     
+  doesn't match the magnitude stored in the label.                              
+  - Fix: In apply_anomalies for intrusion_motion, replace the per-minute coin   
+  flip with k = max(2, round(mag * (e - s))) and moves = np.zeros(e - s, int);  
+  moves[0] = 1; moves[rng.choice(np.arange(1, e - s), size=k - 1,               
+  replace=False)] = 1. This guarantees at least 2 motion minutes and makes the  
+  label's magnitude exact.                                                      
+                                                                                
+  2. Low: the design doc overstates how slow normal cooling is (contradicts the 
+  code)                                                                         
+  - Reason: design.md line 110 says normal night cooling is "~0.4 °C/h, slower  
+  than any heating failure". With a 3 °C gap and a 300-min lag, cooling starts  
+  at about 0.6 °C/h at the 23:00 setback and at the Tue–Thu departure. That's   
+  faster than the slowest failures (0.5 °C/h). A detector that only looks at    
+  how fast the temperature falls would confuse the two, so the context (21 °C   
+  target, awake and home) must be part of the rule.                             
+  - Fix: In design.md line 110, replace the sentence with: "Normal setback      
+  cooling starts at ~0.6 °C/h and slows to ~0.2 °C/h. It overlaps the slowest   
+  heating failures, so the failure is only identifiable in context (falling     
+  while the target is 21 °C)."                                                  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I checked both findings. Both are valid. (I also see the transcript is now in
+  ai_transcripts/002_synthetic_data_generation.txt.)
+
+  #: 1
+  Finding: The shortest intrusions can look like a single stray trigger
+  What I found: Confirmed by simulation: a 5-min intrusion with a motion share
+  of
+  0.3 shows only one motion minute 24% of the time. This seed's data happens to
+   have at least 2 per intrusion, but a different seed wouldn't. The stored
+  magnitude also doesn't match the motion share that's actually produced.
+  My view: Agree, apply. At least 2 motion minutes and an exact magnitude make
+  the label honest. Side effect: it changes the sequence of random numbers, so
+  all the data after that point regenerates differently. I'll re-run all the
+  checks.
+  ────────────────────────────────────────
+  #: 2
+  Finding: design.md overstates how slowly normal cooling happens
+  What I found: Confirmed, and my number was wrong. The 0.42 °C/h I reported was
+
+  averaged over a window starting 30 min after the setback. The fastest normal
+  cooling is 0.56–0.63 °C/h, which overlaps the slowest heating failures (0.5
+  °C/h).
+  My view: Agree, apply. It's a doc fix, but it matters later: the rate of fall
+  alone can't identify a heating failure. A detector also needs the context
+  ("falling while the target is 21 °C"). I'll add that to the README Carry-Over
+   as well.
+
+  Plan: apply #1 in generate_data.py, fix the cooling sentence in design.md
+  (#2), regenerate the data, re-run all the checks, and give you the final
+  numbers again. Shall I go ahead?
+
+✻ Worked for 23s · done Friday 9:48 PM
+
+❯ go ahead                                                                      
+
+● Update(generate_data.py)
+  ⎿  Added 5 lines, removed 2 lines
+      417          elif atype == "compressor_stuck_on":
+      418              readings[cfg.POWER][s:e] = mag + rng.normal(0, cfg
+           .FRIDGE["noise_sd_on"], e - s)
+      419          elif atype == "intrusion_motion":
+      420 -            moves = (rng.random(e - s) < mag).astype(int)     
+      421 -            moves[0] = 1  # the intruder is seen at least once
+          - at the start                                                 
+      420 +            # Exactly round(mag * duration) motion minutes, at
+          + least 2 (never looks like one stray trigger)                 
+      421 +            k = max(2, round(mag * (e - s)))                  
+      422 +            moves = np.zeros(e - s, dtype=int)                
+      423 +            moves[0] = 1  # the intruder is seen at the start 
+      424 +            moves[rng.choice(np.arange(1, e - s), size=k - 1, 
+          +replace=False)] = 1                                           
+      425              readings[cfg.MOTION][s:e] = moves
+      426          elif atype in ("door_open_night", "door_left_open"):
+      427              open_door(readings[cfg.DOOR], readings[cfg.MOTION]
+           , s, e - s, rng, n_home)
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      107    - So "house empty" only occurs on Tue–Thu daytime.
+      108  - **Indoor temperature:**
+      109    - Thermostat targets 21 °C while awake and home, 18 °C at ni
+           ght, and 18 °C eco mode while the house is empty (Tue–Thu dayt
+           ime).
+      110 -  - Room temperature follows the target with a first-order lag
+          -: **45 min when heating, 300 min when cooling**. Normal night 
+          -cooling is ~0.4 °C/h (measured), slower than any heating failu
+          -re.                                                           
+      110 +  - Room temperature follows the target with a first-order lag
+          +: **45 min when heating, 300 min when cooling**. Normal setbac
+          +k cooling (23:00 night setback, Tue–Thu eco mode) starts at ~0
+          +.6 °C/h and slows to ~0.2 °C/h. It overlaps the slowest heatin
+          +g failures (0.5 °C/h), so a failure is only identifiable in co
+          +ntext: falling while the target is 21 °C.                     
+      111    - Afternoon solar gain of ~+0.5 °C, sensor noise ~0.1 °C.
+      112  - **Fridge power:**
+      113    - Compressor 100–130 W for 12–18 min, idle 2–5 W for 18–30 m
+           in (~40% duty).
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      130  | `heating_failure` | 21 °C target throughout the failure **an
+           d** the 150-min recovery reserve | 1.5–3 h fall + recovery | F
+           all rate 0.5–1.0 °C/h, **total drop ≥ 1.5 °C**. Label covers t
+           he recovery too |
+      131  | `fridge_power_loss` | Any time | 45–120 min | Power reads 0–
+           0.5 W |
+      132  | `compressor_stuck_on` | Any time | 1–2 h | Constant 100–130 
+           W (normal run ≤ 18 min) |
+      133 -| `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+          - min | Share of minutes with motion 0.3–0.6, no door opening |
+      133 +| `intrusion_motion` | Tue–Thu while the house is empty | 5–30
+          + min | Share of minutes with motion 0.3–0.6: exactly max(2, ro
+          +und(share × duration)) motion minutes, first minute always on,
+          + no door opening |                                            
+      134  | `door_open_night` | 00:30–05:00 | 1–5 min | Minutes open, wi
+           th hallway motion around it |
+      135  | `door_left_open` | Awake and home | 20–60 min | Minutes open
+            (normal 1–3 min) |
+      136  
+
+● Update(docs\design.md)
+  ⎿  Added 12 lines, removed 1 line
+      198  - **Assumptions:** household profile (two adults, hybrid WFH M
+           on/Fri, house empty only Tue–Thu daytime, one adult always hom
+           e at weekends), thermostat with night setback and eco mode, wi
+           nter heating season, no daylight-saving change.
+      199  - **Data quality:** outages and missing data are handled in cl
+           eaning, not scored as anomalies.
+      200  - **Limitations:** with 2 anomalies per type in validation/tes
+           t, per-type recall can only be 0%, 50% or 100%. Training conta
+           ins unlabelled anomalies (contamination). Anomalous minutes ar
+           e 7–10% per split, higher than a real home, mainly because hea
+           ting-failure labels include the recovery.
+      201 -- **Synthetic data realism:** a reviewer pass fixed 6 issues p
+          -lus 1 follow-up: idle noise, cooling lag, durations, arrival m
+          -otion, stray motion, heating recovery labels, and door-motion 
+          -only at the first and last minute. Mention this as part of the
+          - process.                                                     
+      201 +- **Synthetic data realism:** two reviewer passes fixed:      
+      202 +  - fridge idle noise                                         
+      203 +  - cooling lag                                               
+      204 +  - durations                                                 
+      205 +  - motion before arrival                                     
+      206 +  - stray motion when empty                                   
+      207 +  - heating recovery labels                                   
+      208 +  - door motion only at the first and last minute             
+      209 +  - intrusions always have ≥2 motion minutes                  
+      210 +                                                              
+      211 +  Mention this as part of the process.                        
+      212 +- **Heating failure is contextual:** normal setback cooling (~
+          +0.6 °C/h at its start) overlaps the slowest failures. The rate
+          + of fall alone is not enough; the detector needs the context (
+          +target 21 °C, awake and home).                                
+      213  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      214  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+      215  - **Repo layout:** the tree and a one-line role for each file 
+           (Stage 2).
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      generate_data.py && .venv/Scripts/python "$TMP/verify2.py" > "$TMP/v2.txt"
+      && sed -n '1,4…)
+  ⎿  Rows per split:
+       train: 20,136
+       val  : 10,042
+     … +58 lines (ctrl+o to expand)
+  ⎿  Updated data\generation_log.csv (+6 -6)
+       1  kind,sensor_id,start,end,split
+       2  night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+          02:13,train
+       3 -duplicate_row,all,2024-01-08 03:40,2024-01-08 03:40,train      
+       3  sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+          n
+       4  night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+          04:53,train
+       5  sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+          ain
+       6  night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+          01:37,train
+       8 -duplicate_row,all,2024-01-14 15:28,2024-01-14 15:28,train      
+       7  night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+          04:02,train
+       8 +duplicate_row,all,2024-01-15 19:32,2024-01-15 19:32,train      
+       9  sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+          3,train
+      10  sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+          train
+      11 +duplicate_row,all,2024-01-17 11:55,2024-01-17 11:55,train      
+      12  night_bathroom_trip,motion_hallway,2024-01-19 03:16,2024-01-19 
+          03:17,train
+      13  night_bathroom_trip,motion_hallway,2024-01-20 03:11,2024-01-20 
+          03:11,train
+      14  weekend_guests,motion_hallway;door_front,2024-01-20 20:01,2024-
+          01-20 23:06,train
+     ...
+      16  night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+          04:03,val
+      17  sensor_outage,motion_hallway,2024-01-22 13:52,2024-01-22 14:08,
+          val
+      18  night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+          04:52,val
+      19 -duplicate_row,all,2024-01-25 01:15,2024-01-25 01:15,val        
+      19 +duplicate_row,all,2024-01-23 11:55,2024-01-23 11:55,val        
+      20  hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val
+      21  sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+          9,val
+      22  night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+          03:51,val
+      23 -duplicate_row,all,2024-01-26 07:35,2024-01-26 07:35,val        
+      23  sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val
+      24 +duplicate_row,all,2024-01-27 09:00,2024-01-27 09:00,val        
+      25  sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+          l
+      26  weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+          01-27 23:15,val
+      27  sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+          7,test
+      28 -duplicate_row,all,2024-01-30 03:04,2024-01-30 03:04,test       
+      29 -duplicate_row,all,2024-01-31 11:52,2024-01-31 11:52,test       
+      28 +duplicate_row,all,2024-01-31 15:56,2024-01-31 15:56,test       
+      29  hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test
+      30  sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+          st
+      31  night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+          03:27,test
+      32 +duplicate_row,all,2024-02-02 06:36,2024-02-02 06:36,test       
+      33  night_bathroom_trip,motion_hallway,2024-02-03 01:21,2024-02-03 
+          01:23,test
+      34  night_bathroom_trip,motion_hallway,2024-02-03 02:31,2024-02-03 
+          02:34,test
+      35  sensor_outage,motion_hallway,2024-02-03 14:50,2024-02-03 15:51,
+          test
+  ⎿  … 3 more files changed
+
+● I've applied both fixes, regenerated the data and re-run every check.
+
+  Fix #1, intrusions: every intrusion now has exactly the motion-minute count
+  implied by its label (for example 6 min × 0.43 → 3 minutes). The minimum is 3
+  minutes, so none looks like a single stray trigger.
+
+  ┌──────┬──────────┬─────────────┬────────────────────────────────────┐
+  │  ID  │ Duration │ Label share │ Motion minutes (expected = actual) │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A003 │ 30 min   │ 0.57        │ 17                                 │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A012 │ 29 min   │ 0.35        │ 10                                 │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A016 │ 6 min    │ 0.43        │ 3                                  │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A026 │ 8 min    │ 0.34        │ 3                                  │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A030 │ 29 min   │ 0.42        │ 12                                 │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A040 │ 21 min   │ 0.56        │ 12                                 │
+  ├──────┼──────────┼─────────────┼────────────────────────────────────┤
+  │ A043 │ 16 min   │ 0.37        │ 6                                  │
+  └──────┴──────────┴─────────────┴────────────────────────────────────┘
+
+  Fix #2, design.md:
+  - The cooling sentence now says normal setback cooling starts at ~0.6 °C/h.
+    The data agrees: the fastest normal night cooling has a median of 0.56 °C/h
+    and a maximum of 0.63 °C/h.
+  - The anomaly table now describes the exact motion-minute rule.
+  - The README Carry-Over has a new point: heating failure can only be
+    identified in context.
+
+  Final numbers (unchanged from the last run)
+
+  The labels are planned before any readings are generated, so the label rates
+  are identical. Only the motion readings after the intrusion step were
+  regenerated.
+
+  ┌───────┬────────┬───────┬────────┬────────┬───────┬────────────┐
+  │ Split │  Rows  │ Temp  │ Fridge │ Motion │ Door  │ Any sensor │
+  ├───────┼────────┼───────┼────────┼────────┼───────┼────────────┤
+  │ Train │ 20,136 │ 3.99% │ 2.48%  │ 0.32%  │ 0.54% │ 7.33%      │
+  ├───────┼────────┼───────┼────────┼────────┼───────┼────────────┤
+  │ Val   │ 10,042 │ 4.91% │ 3.46%  │ 0.37%  │ 1.10% │ 9.84%      │
+  ├───────┼────────┼───────┼────────┼────────┼───────┼────────────┤
+  │ Test  │ 10,049 │ 5.24% │ 2.56%  │ 0.37%  │ 0.99% │ 9.16%      │
+  └───────┴────────┴───────┴────────┴────────┴───────┴────────────┘
+
+  The other checks are unchanged:
+  - Counts: 3/2/2 per type, with every data-quality issue present in every
+    split.
+  - Fridge: compressor on 41% of the time, idle never below 1.1 W.
+  - Door: 4.7 openings per day.
+  - Motion: none before any arrival to an empty house (0 of 11), and 7 stray
+    minutes over 12 empty days.
+  - Heating failures: drops of 1.8–2.4 °C.
+
+  This follow-up happened after your last export, so it will be in the next
+  transcript. Is Stage 3 approved? If so, we'll start Cleaning & EDA.
+
+✻ Brewed for 31s · done Friday 9:49 PM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, and the synthetic data generator is finished, with all reviewer fixes applied and checked. Next step: you approve Stage 3, then we start Cleaning & EDA. (disable recaps in /config)
+
+❯ Approved, commit this and move to Cleaning & EDA                              
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Nothing new to commit: you've already committed everything (06cc99c [Fix] 
+  Small Fixes) and the working tree is clean, so it includes the latest
+  intrusion fix and design changes.
+
+  Stage 4: Cleaning & EDA
+
+  We'll go through it in this order, then I'll write analysis.ipynb and the
+  cleaning functions in features.py:
+  1. Which data each part of EDA may look at
+  2. Data-quality checks and the cleaning policy
+  3. Plots
+  4. Preprocessing needed for each sensor
+
+  Topic 1: which data each part of EDA may look at
+
+  EDA influences decisions such as thresholds and features. If we look at sensor
+  patterns in validation or test, those splits leak into the design. My
+  proposal:
+
+  Part of EDA: Sensor behaviour (time series, daily/weekly profiles,
+  distributions)
+  Data: Train only
+  Why: These plots drive modelling decisions
+  ────────────────────────────────────────
+  Part of EDA: Data-quality checks (missing values, duplicates, gaps)
+  Data: All splits
+  Why: The checks are mechanical, and production will run the same checks on any
+
+  data
+  ────────────────────────────────────────
+  Part of EDA: Anomaly counts and affected minutes per type and sensor
+  Data: All splits, from anomaly_labels.csv
+  Why: Documentation only, and the counts are fixed by design anyway
+  ────────────────────────────────────────
+  Part of EDA: Plots of injected anomalies
+  Data: Train only
+  Why: Shows what the anomalies look like without looking at val/test readings
+
+  Question: Do you agree with this split? The main trade-off: we won't visually
+  inspect validation or test readings at all before the final evaluation.
+
+✻ Cogitated for 18s · done Friday 10:26 PM
+
+※ recap: We're building a smart-home anomaly-detection proof of concept and have just started Cleaning & EDA, after you approved the data generation stage. Next, I need your answer on whether sensor-behaviour plots should use only the training data.
+
+❯ Agree. Also, in the cleaning decisions like gap filling, outlier limits       
+  should be set from train only and then just applied to test/validation. Be    
+  careful there.                                                                
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 16 lines
+      189  
+      190  ---
+      191  
+      192 +## Stage 4 – Cleaning & EDA                                   
+      193 +                                                              
+      194 +### Data scope (leakage rules)                                
+      195 +                                                              
+      196 +| EDA part | Data used |                                      
+      197 +|---|---|                                                     
+      198 +| Sensor behaviour (time series, daily/weekly profiles, distri
+          +butions) | Train only |                                       
+      199 +| Data-quality checks (missing values, duplicates, gaps, times
+          +tamp consistency) | All splits (mechanical, same as production
+          +) |                                                           
+      200 +| Anomaly counts / affected minutes per type and sensor | All 
+          +splits, from `anomaly_labels.csv` (documentation only) |      
+      201 +| Plots of injected anomalies | Train only |                  
+      202 +                                                              
+      203 +- Val and test readings are not visually inspected before fina
+          +l evaluation.                                                 
+      204 +- **Any cleaning parameter learned from data (gap-fill limits,
+          + value limits, scaling) is fit on train only** and then applie
+          +d unchanged to val/test and the production stream.            
+      205 +                                                              
+      206 +---                                                           
+      207 +                                                              
+      208  ## README Carry-Over
+      209  Items to include in README.md when it is written at the end:
+      210  
+
+● I've recorded Topic 1 in design.md, including your rule that any cleaning
+  parameter is fit on train only.
+
+  Topic 2: data-quality checks and the cleaning policy
+
+  One assumption to challenge first (high priority): cleaning should not remove 
+  or clip outliers. In anomaly detection the outliers are what we're trying to
+  find. Clipping temperature at limits learned from train would erase the
+  temp_spike anomalies before any detector sees them. What cleaning can safely
+  do is reject physically impossible values. Those limits come from the sensor's
+  hardware specification, for example temperature outside −10 to 50 °C or
+  fridge power below 0 W, not from the data. Limits learned from train do belong
+  somewhere: in the detectors, as thresholds. We'll handle that in the model
+  stage.
+
+  Proposed cleaning steps. Each one works on one row at a time using only past
+  data, so production streaming can use exactly the same code:
+
+  ┌──────┬──────────────────────┬───────────────────────────────────────────┐
+  │ Step │        Check         │                  Action                   │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 1    │ Timestamp order      │ Sort; in a stream, ignore any row older   │
+  │      │                      │ than the last one seen                    │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 2    │ Duplicate timestamps │ Keep the first, drop the rest             │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 3    │ Gaps (hub outage)    │ Rebuild a regular 1-min timeline, so      │
+  │      │                      │ missing rows become NaN rows              │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 4    │ Impossible values    │ Set to NaN (hardware limits, not learned) │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 5    │ Short gaps (dropped  │ Fill forward with the last value, for at  │
+  │      │ readings)            │ most N minutes                            │
+  ├──────┼──────────────────────┼───────────────────────────────────────────┤
+  │ 6    │ Long gaps (sensor or │ Leave as NaN, flag the sensor as offline, │
+  │      │  hub outage)         │  and skip detection for that sensor       │
+  └──────┴──────────────────────┴───────────────────────────────────────────┘
+
+  - Only past values are used for filling, never interpolation from future
+    readings, which would be impossible in real time.
+  - The offline flag is reported as a data-quality alert and kept out of the
+    anomaly metrics, as decided in Stage 1.
+
+  Questions:
+  1. Do you agree to keep outliers in the data and move learned limits to the
+     detectors?
+  2. How long can a gap be before we stop filling it (N)? I suggest 2 min for
+     every sensor. That covers single dropped readings, and anything longer is
+     treated as an outage. Train data would only confirm whether single-minute
+     gaps are the typical case. We could instead learn a separate N per sensor
+     from the train gap lengths, but that adds complexity for little gain.
+
+✻ Baked for 23s · done Friday 10:41 PM
+
+※ recap: Goal: a smart-home anomaly detection proof of concept; data generation is done and committed, and we're now on Cleaning & EDA. Next: answer whether to keep outliers in the data and confirm a 2-minute gap-fill limit.
+
+❯ Agreed. By outlier limits, I meant the scaled value  in training data should  
+  be just applied on test/validation; not scaled again.N=2 should be fine.Keep  
+  EDA lean: propose the plots and preprocessing in one go just for this step,   
+  max 3-4 plots and then lets move to writing the notebook                      
+
+● Update(docs\design.md)
+  ⎿  Added 16 lines, removed 1 line
+      201  | Plots of injected anomalies | Train only |
+      202  
+      203  - Val and test readings are not visually inspected before fina
+           l evaluation.
+      204 -- **Any cleaning parameter learned from data (gap-fill limits,
+          - value limits, scaling) is fit on train only** and then applie
+          -d unchanged to val/test and the production stream.            
+      204 +- **Any parameter learned from data (e.g. scaling statistics) 
+          +is fit on train only** and then applied unchanged to val/test 
+          +and the production stream. Nothing is ever re-fit on val/test.
+      205  
+      206 +### Cleaning policy                                           
+      207 +Every step is causal (past data only), so the same code serves
+          + batch and streaming.                                         
+      208 +                                                              
+      209 +| Step | Check | Action |                                     
+      210 +|---|---|---|                                                 
+      211 +| 1 | Timestamp order | Sort; in a stream, ignore rows older t
+          +han the last seen |                                           
+      212 +| 2 | Duplicate timestamps | Keep first |                     
+      213 +| 3 | Gaps (hub outage) | Reindex to a regular 1-min grid; mis
+          +sing rows become NaN |                                        
+      214 +| 4 | Physically impossible values | Set to NaN, using fixed h
+          +ardware limits (not learned) |                                
+      215 +| 5 | Short gaps | Forward-fill, **at most 2 min** (all sensor
+          +s) |                                                          
+      216 +| 6 | Longer gaps | Leave NaN, flag sensor **offline**, skip d
+          +etection for that sensor. Reported as data quality, not anomal
+          +ies |                                                         
+      217 +                                                              
+      218 +- **Outliers are not clipped or removed in cleaning.** They ar
+          +e the detection targets (e.g. `temp_spike`). Learned limits be
+          +long to the detectors.                                        
+      219 +- No interpolation, because it would use future values.       
+      220 +                                                              
+      221  ---
+      222  
+      223  ## README Carry-Over
+
+● Understood. To restate your rule: scaling is fit on train once and then
+  applied as-is to validation and test, never re-fit. It's recorded, along with
+  N = 2, in design.md.
+
+  Plots (train only, 4 plots)
+
+  ┌─────┬──────────────────────────────────────┬────────────────────────────┐
+  │  #  │                 Plot                 │       What it shows        │
+  ├─────┼──────────────────────────────────────┼────────────────────────────┤
+  │     │ One train week, 4 stacked sensor     │ Normal behaviour and what  │
+  │ 1   │ panels, with anomalies shaded by     │ each anomaly looks like in │
+  │     │ type                                 │  context                   │
+  ├─────┼──────────────────────────────────────┼────────────────────────────┤
+  │     │ Daily profile by day type (Tue–Thu / │ Daily and weekly patterns. │
+  │ 2   │  Mon & Fri / weekend): hourly mean   │  This confirms the day     │
+  │     │ temperature, fridge on-share, motion │ type is the context a      │
+  │     │  rate, door rate                     │ detector needs.            │
+  ├─────┼──────────────────────────────────────┼────────────────────────────┤
+  │     │                                      │ Whether a simple threshold │
+  │ 3   │ Distributions, normal vs anomalous   │  separates the anomalies,  │
+  │     │ minutes, per sensor                  │ or whether context is      │
+  │     │                                      │ needed                     │
+  ├─────┼──────────────────────────────────────┼────────────────────────────┤
+  │     │ Fridge run lengths: histogram of how │ Power loss and stuck-on    │
+  │ 4   │  long each on/off period lasts,      │ stand out by duration, not │
+  │     │ normal vs anomalous                  │  by value                  │
+  └─────┴──────────────────────────────────────┴────────────────────────────┘
+
+  Plus two tables, which don't count towards the 4 plots:
+  - A data-quality summary for each split: missing cells, duplicate rows, gaps,
+    and offline periods detected compared with the generation log.
+  - Anomaly counts and affected minutes by type and sensor.
+
+  Preprocessing for each sensor
+
+  ┌─────────────┬────────────────────────────┬──────────────────────────────┐
+  │   Sensor    │        Raw problem         │  Preprocessing (all causal)  │
+  ├─────────────┼────────────────────────────┼──────────────────────────────┤
+  │ Temperature │ Normal level depends on    │ Rate of change over 15 and   │
+  │             │ context                    │ 60 min                       │
+  ├─────────────┼────────────────────────────┼──────────────────────────────┤
+  │             │ Raw watts have three modes │ Derived state (idle /        │
+  │ Fridge      │  (idle, on, defrost), so   │ running / defrost) and       │
+  │             │ the raw value means little │ minutes in the current state │
+  ├─────────────┼────────────────────────────┼──────────────────────────────┤
+  │ Motion      │ Binary and sparse          │ Motion minutes in the last   │
+  │             │                            │ 15 and 60 min                │
+  ├─────────────┼────────────────────────────┼──────────────────────────────┤
+  │ Door        │ Binary                     │ Minutes the door has been    │
+  │             │                            │ open                         │
+  ├─────────────┼────────────────────────────┼──────────────────────────────┤
+  │ All         │ Context                    │ Hour of day and day type     │
+  └─────────────┴────────────────────────────┴──────────────────────────────┘
+
+  - Scaling (medium priority, a challenge): neither of our planned models needs
+    it. Rules use real units (°C, W, minutes), and Isolation Forest is
+    tree-based, so it gives the same result whatever the scale. So I propose no 
+    scaling. If a later model needs it, it's fit on train only, as agreed.
+  - Missing values: Isolation Forest can't handle NaN. A single detector for all
+    four sensors would have to skip the whole minute whenever one sensor is
+    offline. I'll note this for the model stage rather than decide it now.
+  - Code location: the cleaning and features go in features.py. The notebook
+    calls them and doesn't hold its own copy of the logic.
+
+  Question: Should I go ahead with these 4 plots and this preprocessing? If yes,
+  I'll install matplotlib and jupyter, write features.py, and then write the
+  notebook.
+✻ Cooked for 26s · done Friday 10:56 PM
+
+※ recap: We're building the smart-home anomaly detection proof of concept and are now in Stage 4, Cleaning & EDA. Next, you approve the 4 proposed plots and preprocessing so I can write `features.py` and the notebook.
+
+❯ Apporve 4 plots and scaling. Use training label when applicable and make the  
+  plots readable.  Also, in the preprovessing table: the temperature row says   
+  the normal level depends on context but  o0nly used rate of change, "21°C     
+  isnt observed. Some deviation for the typical vale for this hour and day type 
+  for training dataset and that also shoul be a baseline too. Also thre         
+  thresholds can be fixed for the three modes and dont tune.                    
+
+● Skill(dataviz)
+  ⎿  Successfully loaded skill
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I'll record the two preprocessing decisions in design.md, then install the
+  plotting and notebook packages.
+
+● Update(docs\design.md)
+  ⎿  Added 24 lines
+      218  - **Outliers are not clipped or removed in cleaning.** They ar
+           e the detection targets (e.g. `temp_spike`). Learned limits be
+           long to the detectors.
+      219  - No interpolation, because it would use future values.
+      220  
+      221 +### EDA plots (train only; train labels used for shading and n
+          +ormal-vs-anomalous splits)                                    
+      222 +1. One train week, 4 stacked sensor panels, anomalies shaded b
+          +y type.                                                       
+      223 +2. Daily profile by day type (Tue–Thu / Mon & Fri / weekend). 
+      224 +3. Distributions, normal vs anomalous minutes, per sensor.    
+      225 +4. Fridge run lengths per mode, normal vs anomalous.          
+      226 +                                                              
+      227 +Plus tables: a data-quality summary per split, and anomaly cou
+          +nts / affected minutes by type and sensor.                    
+      228 +                                                              
+      229 +### Preprocessing (implemented in `features.py`, all causal)  
+      230 +                                                              
+      231 +| Sensor | Features |                                         
+      232 +|---|---|                                                     
+      233 +| Temperature | **Deviation from the train baseline** (median 
+          +for this hour × day type), rate of change over 15 and 60 min (
+          +°C/h) |                                                       
+      234 +| Fridge | Mode from **fixed thresholds**: idle < 50 W, runnin
+          +g 50–200 W, defrost ≥ 200 W (not tuned). Minutes in current mo
+          +de |                                                          
+      235 +| Motion | Motion minutes in the last 15 and 60 min |         
+      236 +| Door | Minutes the door has been open |                     
+      237 +| All | Hour of day, day type (`tue_thu`, `mon_fri`, `weekend`
+          +) |                                                           
+      238 +                                                              
+      239 +- **Temperature baseline:** the thermostat target (21 °C) is n
+          +ot observed by any sensor, so the expected level is learned. I
+          +t is the median temperature per hour × day type on **train onl
+          +y**, fit once and then applied unchanged to val/test.         
+      240 +  - It uses the median **without labels**, because a real syst
+          +em has no labels. The median is robust to the ~4% contaminated
+          + minutes.                                                     
+      241 +  - This is the first learned parameter.                      
+      242 +- **Fridge mode thresholds** are fixed from the physics (idle 
+          +≤ ~5 W, compressor 100–130 W, defrost ~300 W), with no tuning.
+          + Power loss appears as idle mode with an unusually long run an
+          +d a near-0 W value.                                           
+      243 +- **No scaling:** the rules use physical units and Isolation F
+          +orest is scale-invariant. If a later model needs scaling, it i
+          +s fit on train only.                                          
+      244 +                                                              
+      245  ---
+      246  
+      247  ## README Carry-Over
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Packages are set up—matplotlib, nbconvert, and ipykernel installed, though the
+  full notebook server failed on pyyaml under Python 3.15 (not an issue since
+  nbconvert and VS Code can still run the notebook). Moving on to features.py
+  now.
+
+● Write(features.py)
+  ⎿  Wrote 231 lines to features.py
+       1 """Shared cleaning and causal feature functions.
+       3 Used by analysis.ipynb, detect_anomalies.py and inference.py so 
+         training and
+         ge 4).
+       5 
+       7     - Every step is causal: a value at time t only uses data up 
+         to t.
+          only.
+       9     - Labels are only used by the evaluation/EDA helpers at the 
+      10 """
+     … +262 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Cleaning checks out: each split shows exactly 2 offline periods per sensor, 2
+  duplicates, and gap rows aligned with the hub outage. Now I'll build the
+  notebook.
+
+  Made 1 scratchpad edit +260 (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+     [NbConvertApp] Converting notebook analysis.ipynb to notebook
+     C:\Users\Gracy\Projects\Anomaly Detection\.venv\Lib\site-packages\zmq\
+     … +14 lines (ctrl+o to expand)
+  ⎿  5 files changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+● The notebook ran end to end. Now I'll look at each plot before reporting
+  anything.
+
+  Read 4 files, ran 1 shell command (ctrl+o to expand)
+
+● All tables match the generation log correctly. I'll now fix bin ranges on two
+  plots, flag a data issue, and add a findings section summarizing these
+  results.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+     [NbConvertApp] Writing 900535 bytes to analysis.ipynb
+  ⎿  3 files changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Read 2 files (ctrl+o to expand)
+
+● The images didn't change, so my string replacements probably didn't match.
+  Checking:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The fixes are in and the PNGs were rewritten. The image reader seems to have
+  returned cached copies, so I'll view fresh copies instead.
+
+  Read 2 files, ran 2 shell commands (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -m
+      nbconvert --to notebook --execute --inplace analysis.ipynb 2>&1 | grep -i
+      "error\|Writ…)
+  ⎿  [NbConvertApp] Writing 893953 bytes to analysis.ipynb
+     -rw-r--r-- 1 Gracy 197121 91474 2026-10-24 14:39:14.919097500 +0800 ou
+     tputs/eda/3_distributions.png
+     … +2 lines (ctrl+o to expand)
+  ⎿  1 file changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● The notebook reverted to the old 20-cell version, likely because an open
+  editor (probably VS Code) saved a stale copy over my update. I'll rebuild it
+  again and verify the file sticks this time.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+     [NbConvertApp] Writing 900535 bytes to analysis.ipynb
+     2
+     … +7 lines (ctrl+o to expand)
+  ⎿  3 files changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● The notebook is now finalized with the findings and new bins correctly in
+  place. Next, I'll add these findings to design.md.
+
+● Update(docs\design.md)
+  ⎿  Added 10 lines
+      242  - **Fridge mode thresholds** are fixed from the physics (idle 
+           ≤ ~5 W, compressor 100–130 W, defrost ~300 W), with no tuning.
+            Power loss appears as idle mode with an unusually long run an
+           d a near-0 W value.
+      243  - **No scaling:** the rules use physical units and Isolation F
+           orest is scale-invariant. If a later model needs scaling, it i
+           s fit on train only.
+      244  
+      245 +### EDA findings (from `analysis.ipynb`, plots in `outputs/eda
+          +/`)                                                           
+      246 +- **Data quality:** per split there are 2 duplicate rows, 1 hu
+          +b outage (26 / 40 / 33 missing rows) and 0 out-of-order timest
+          +amps. Cleaning detects exactly 2 offline periods per sensor pe
+          +r split, matching the generation log. Offline minutes = logged
+          + minutes − 2 per outage (the forward fill).                   
+      247 +                                                              
+      248 +| Sensor | Observation (train) | Implication for detection |  
+      249 +|---|---|---|                                                 
+      250 +| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Spikes
+          + at ±3.5–4.3 °C deviation. Heating failure + recovery spans −2
+          +.2 to 0 °C, overlapping the normal tail | Deviation catches sp
+          +ikes. Heating failure needs duration / rate in context |      
+      251 +| Fridge | No daily pattern. Stuck-on power equals normal runn
+          +ing. Power loss ≤ 0.6 W vs idle ≥ 1.1 W | **Mode duration** se
+          +parates: normal idle ≤ 30, running ≤ 22 min vs anomalous 72–13
+          +7 / 77–93 min |                                               
+      252 +| Motion | ~0 Tue–Thu 09–16 h. Intrusion counts overlap normal
+          + home activity | Needs context (expected empty house) |       
+      253 +| Door | Normal openings ≤ 4 min, `door_left_open` up to 41 mi
+          +n. Night openings have normal duration | Duration for left-ope
+          +n; time of day for night |                                    
+      254 +                                                              
+      255  ---
+      256  
+      257  ## README Carry-Over
+
+● I've written features.py and analysis.ipynb and run the notebook. All 4 plots
+  are saved in outputs/eda/, and the findings are in design.md.
+
+  One problem to know about: an editor, probably VS Code with the notebook open,
+  saved an old copy over my rebuilt analysis.ipynb once. I rebuilt it and the
+  file is now correct. If you have it open, reload it from disk before saving,
+  or it may overwrite it again.
+
+  What was built
+
+  - features.py, organised into headed sections:
+    - Cleaning: removes duplicates, rebuilds a regular 1-min timeline, blanks
+      impossible values, forward-fills up to 2 min, flags offline sensors.
+    - Data-quality report.
+    - Features: the train-only temperature baseline, temperature deviation and
+      rate of change, fridge mode from fixed thresholds with minutes in mode,
+      motion counts, door-open minutes.
+    - Label helpers: EDA only, kept separate from the features.
+  - analysis.ipynb: 2 tables, 4 plots and a findings section.
+
+  Main results
+
+  - Data quality: cleaning finds exactly the outages in the generation log, 2
+    offline periods per sensor in every split. The offline minutes equal the
+    logged outage minutes minus 2 per outage (the forward fill). Duplicates (2
+    per split) and hub gaps (26/40/33 rows) are all caught.
+  - What each anomaly needs to be detected:
+
+  ┌─────────────┬──────────────────────────────┬────────────────────────────┐
+  │   Sensor    │     Separable by value?      │ What actually separates it │
+  ├─────────────┼──────────────────────────────┼────────────────────────────┤
+  │             │ Spikes: yes (±3.5–4.3 °C     │                            │
+  │ Temperature │ from the baseline). Heating  │ Rate of fall plus context  │
+  │             │ failure: no (overlaps the    │                            │
+  │             │ normal tail)                 │                            │
+  ├─────────────┼──────────────────────────────┼────────────────────────────┤
+  │             │ Power loss: yes (≤ 0.6 W,    │ Time in mode: normal idle  │
+  │ Fridge      │ against an idle minimum of   │ ≤ 30 min and running ≤ 22  │
+  │             │ 1.1 W). Stuck-on: no (same   │ min, against anomalous     │
+  │             │ watts as normal running)     │ 72–137 and 77–93 min       │
+  ├─────────────┼──────────────────────────────┼────────────────────────────┤
+  │             │ No (intrusion counts overlap │ Context: the house is      │
+  │ Motion      │  normal home activity)       │ expected to be empty on    │
+  │             │                              │ Tue–Thu, 09–16 h           │
+  ├─────────────┼──────────────────────────────┼────────────────────────────┤
+  │ Door        │ Left open: yes (normal       │ Night opening: time of day │
+  │             │ openings ≤ 4 min)            │                            │
+  └─────────────┴──────────────────────────────┴────────────────────────────┘
+
+  - The fridge shows no daily pattern, so time context only matters for
+    temperature, motion and door.
+
+  Data issue found (medium priority)
+
+  In plot 1, Mon 8 Jan from 00:00 to about 07:00 sits at 18 °C, while every
+  other night stays near 20 °C. This is a start-up artifact: the simulation
+  starts at the night setback temperature instead of a settled room. For about 7
+  hours it looks like a 2 °C heating failure. It also adds normal minutes to
+  the −2 °C tail in plot 3 and lowers the Monday baseline slightly. Train is the
+  only split affected.
+
+  Proposed fix: in generate_data.py, simulate one day before the start date and
+  discard it, so day 1 begins from a realistic state. This changes the generated
+  data, so I'd regenerate it and re-run the notebook.
+
+  Questions:
+  1. Should I apply the start-up fix?
+  2. Are the plots readable enough, or should anything change?
+
+✻ Crunched for 8m 55s · done 2:40 PM
+※ recap: We're building a smart-home anomaly detection proof of concept and have finished Cleaning & EDA (features.py, analysis.ipynb, 4 plots). Next, approve the start-up temperature fix and review the plots before we move to model comparison. (disable recaps in /config)
+
+❯ apply the start-up fix.Resun all checks after gernation and show the stats of 
+  anomalyv events and its minutes. Plots are good. also for val/test, we also   
+  have to make sure the first hour isnt broken. Also temp_rate_15 isvery noisy; 
+  lets smooth or fix. I have closed the ipynb so you can rerun the notebook.    
+
+● I'll make the three changes, then regenerate and re-run everything.
+
+  1. Start-up fix (generate_data.py): run day 1's thermostat schedule once as a
+     warm-up and start the real simulation from the temperature it ends at,
+     which is a realistic midnight value. It uses no random numbers, so only the
+     temperature in the first hours changes.
+  2. Split-start warm-up (features.py): build val and test features with the
+     last 3 h of the previous split in front, then drop those rows. This is past
+     data, exactly as a live stream would have. It's used only as history for
+     the calculations, never to fit anything.
+  3. Smoother temp_rate: compute the rate from 15-min rolling means instead of
+     two single readings.
+
+● Update(generate_data.py)
+  ⎿  Added 3 lines, removed 2 lines
+      291      return t["solar_gain"] * np.sin(np.pi * phase)
+      292  
+      293  
+      294 -def temperature_physics(target, solar, fall_rate):            
+      294 +def temperature_physics(target, solar, fall_rate, initial=None
+          +):                                                            
+      295      """Noise-free room temperature.
+      296  
+      297      First-order lag towards target + solar gain: fast when hea
+           ting, slow when cooling.
+      298      Heating failure overrides with a steady fall (fall_rate in
+            degC/hour, NaN = heating works).
+      299 +    initial: starting temperature (default: the first target).
+      300      """
+      301      t = cfg.TEMPERATURE
+      302      alpha_heat = 1.0 / t["lag_heat_minutes"]
+      303      alpha_cool = 1.0 / t["lag_cool_minutes"]
+      304      temp = np.empty(len(target))
+      304 -    current = target[0]                                       
+      305 +    current = target[0] if initial is None else initial       
+      306      for i in range(len(target)):
+      307          if np.isnan(fall_rate[i]):
+      308              goal = target[i] + solar[i]
+
+● Update(generate_data.py)
+  ⎿  Added 9 lines
+      313      return temp
+      314  
+      315  
+      316 +def settled_start_temperature(target, solar):                 
+      317 +    """Burn-in: run day 1's schedule once and return its end-o
+          +f-day (midnight) temperature.                                 
+      318 +                                                              
+      319 +    Avoids a start-up artifact where the series begins at the 
+          +18 degC setback.                                              
+      320 +    """                                                       
+      321 +    day = slice(0, MIN_PER_DAY)                               
+      322 +    return temperature_physics(target[day], solar[day], np.ful
+          +l(MIN_PER_DAY, np.nan))[-1]                                   
+      323 +                                                              
+      324 +                                                              
+      325  def add_sensor_noise(values, sd, rng):
+      326      """Gaussian measurement noise."""
+      327      return values + rng.normal(0, sd, len(values))
+
+● Update(generate_data.py)
+  ⎿  Added 3 lines, removed 2 lines
+      597  
+      598      # Temperature: noise-free with and without failures, then 
+           label the recovery
+      599      solar = solar_gain(tod)
+      600 -    temp_failed = temperature_physics(target, solar, heating_f
+          -all_rate(anomalies, len(index)))                              
+      601 -    temp_normal = temperature_physics(target, solar, np.full(l
+          -en(index), np.nan))                                           
+      600 +    start_temp = settled_start_temperature(target, solar)     
+      601 +    temp_failed = temperature_physics(target, solar, heating_f
+          +all_rate(anomalies, len(index)), start_temp)                  
+      602 +    temp_normal = temperature_physics(target, solar, np.full(l
+          +en(index), np.nan), start_temp)                               
+      603      extend_heating_labels(anomalies, temp_failed, temp_normal)
+      604  
+      605      # Normal behaviour for the other sensors
+
+● Update(features.py)
+  ⎿  Added 2 lines
+      24      cfg.DOOR: (0, 1),
+      25  }
+      26  FFILL_LIMIT_MINUTES = 2      # short gaps filled forward; longe
+          r gaps = sensor offline
+      27 +WARMUP_MINUTES = 180         # history prepended from the previ
+         +ous split (longest lookback + margin)                          
+      28 +TEMP_SMOOTH_MINUTES = 15     # rolling mean before computing te
+         +mperature rates                                                
+      29  
+      30  FRIDGE_IDLE_MAX_W = 50.0     # below: idle
+      31  FRIDGE_DEFROST_MIN_W = 200.0 # at/above: defrost; in between: r
+          unning
+
+● Update(features.py)
+  ⎿  Added 26 lines
+      109  
+      110  
+      111  # ============================================================
+      112 +# Warm-up from the previous split (past data only, as a live s
+          +tream would have)                                             
+      113 +# ============================================================
+      114 +def previous_split(split):                                    
+      115 +    """Name of the split just before this one (None for the fi
+          +rst)."""                                                      
+      116 +    order = list(cfg.SPLITS)                                  
+      117 +    i = order.index(split)                                    
+      118 +    return order[i - 1] if i > 0 else None                    
+      119 +                                                              
+      120 +                                                              
+      121 +def clean_split_with_warmup(split, warmup=WARMUP_MINUTES):    
+      122 +    """Clean a split with the last `warmup` minutes of the pre
+          +vious split in front.                                         
+      123 +                                                              
+      124 +    The warm-up rows only give history to rolling/run-length f
+          +eatures; they are                                             
+      125 +    dropped again in split_features. Nothing is fit on them.  
+      126 +    """                                                       
+      127 +    start, end = cfg.SPLITS[split]                            
+      128 +    prev = previous_split(split)                              
+      129 +    if prev is None:                                          
+      130 +        return clean_split(split)                             
+      131 +    warm_start = pd.Timestamp(start) - pd.Timedelta(minutes=wa
+          +rmup)                                                         
+      132 +    prev_raw = load_split(prev)                               
+      133 +    raw = pd.concat([prev_raw[prev_raw["timestamp"] >= warm_st
+          +art], load_split(split)])                                     
+      134 +    return clean(raw, warm_start, end)                        
+      135 +                                                              
+      136 +                                                              
+      137 +# ============================================================
+      138  # Data-quality report
+      139  # ============================================================
+      140  def count_runs(mask):
+
+● Update(features.py)
+  ⎿  Added 10 lines, removed 5 lines
+      202  
+      203  
+      204  def temperature_features(df, baseline):
+      205 -    """Deviation from the train baseline and rate of change (d
+          -egC/hour)."""                                                 
+      205 +    """Deviation from the train baseline (raw, keeps spikes) a
+          +nd smoothed rate of change (degC/hour).                       
+      206 +                                                              
+      207 +    Rates compare 15-min rolling means instead of single readi
+          +ngs, which cuts sensor noise.                                 
+      208 +    """                                                       
+      209      temp = df[cfg.TEMP]
+      210 +    smooth = temp.rolling(TEMP_SMOOTH_MINUTES, min_periods=10)
+          +.mean()                                                       
+      211 +    baseline_values = lookup_temp_baseline(df, baseline)      
+      212      return pd.DataFrame({
+      208 -        "temp_baseline": lookup_temp_baseline(df, baseline),  
+      209 -        "temp_dev": temp - lookup_temp_baseline(df, baseline),
+      210 -        "temp_rate_15": (temp - temp.shift(15)) * (60 / 15),  
+      211 -        "temp_rate_60": (temp - temp.shift(60)),              
+      213 +        "temp_baseline": baseline_values,                     
+      214 +        "temp_dev": temp - baseline_values,                   
+      215 +        "temp_rate_15": (smooth - smooth.shift(15)) * (60 / 15
+          +),                                                            
+      216 +        "temp_rate_60": (smooth - smooth.shift(60)),          
+      217      }, index=df.index)
+      218  
+      219  
+
+● Update(features.py)
+  ⎿  Added 7 lines
+      253                        motion_features(df), door_features(df)],
+            axis=1)
+      254  
+      255  
+      256 +def split_features(split, baseline):                          
+      257 +    """Features for one split, computed with warm-up history a
+          +nd trimmed to the split."""                                   
+      258 +    start, end = cfg.SPLITS[split]                            
+      259 +    feats = build_features(clean_split_with_warmup(split), bas
+          +eline)                                                        
+      260 +    return feats.loc[pd.Timestamp(start):]                    
+      261 +                                                              
+      262 +                                                              
+      263  # ============================================================
+      264  # Labels -> per-minute view (evaluation / EDA only, never a mo
+           del input)
+      265  # ============================================================
+
+● Now I'll regenerate the data and run all the checks, plus new ones for the
+  start-up fix, the split-start warm-up and the rate noise.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      generate_data.py | sed -n '/Anomalous/,/^$/p' && .venv/Scripts/python
+      "$TMP/verify2.py" |…)
+  ⎿  Anomalous minutes (% of split minutes, per sensor):
+            temp_living_room  power_fridge  motion_hallway  door_front  any
+     _sensor
+     … +35 lines (ctrl+o to expand)
+  ⎿  Updated data\anomaly_labels.csv (+50 -50)
+       1 -anomaly_id,anomaly_type,sensor_id,start,end,magnitude,magnitude
+         -_unit,split                                                    
+       2 -A001,compressor_stuck_on,power_fridge,2024-01-08 22:38,2024-01-
+         -08 23:51,103.68,W,train                                        
+       3 -A002,door_open_night,door_front,2024-01-09 03:18,2024-01-09 03:
+         -22,5.0,min,train                                               
+       4 -A003,intrusion_motion,motion_hallway,2024-01-09 13:30,2024-01-0
+         -9 13:59,0.57,fraction_of_minutes,train                         
+       5 -A004,temp_spike,temp_living_room,2024-01-09 20:17,2024-01-09 20
+         -:17,-4.15,degC,train                                           
+       6 -A005,door_open_night,door_front,2024-01-11 01:04,2024-01-11 01:
+         -08,5.0,min,train                                               
+       7 -A006,fridge_power_loss,power_fridge,2024-01-11 21:44,2024-01-11
+         - 23:33,0.1,W,train                                             
+       8 -A007,temp_spike,temp_living_room,2024-01-12 03:37,2024-01-12 03
+         -:37,3.61,degC,train                                            
+       9 -A008,fridge_power_loss,power_fridge,2024-01-12 07:44,2024-01-12
+         - 09:26,0.49,W,train                                            
+      10 -A009,fridge_power_loss,power_fridge,2024-01-13 03:02,2024-01-13
+         - 03:57,0.09,W,train                                            
+      11 -A010,door_left_open,door_front,2024-01-13 08:53,2024-01-13 09:3
+         -3,41.0,min,train                                               
+      12 -A011,heating_failure,temp_living_room,2024-01-14 15:14,2024-01-
+         -14 19:56,0.69,degC_per_hour,train                              
+      13 -A012,intrusion_motion,motion_hallway,2024-01-16 10:17,2024-01-1
+         -6 10:45,0.35,fraction_of_minutes,train                         
+      14 -A013,door_left_open,door_front,2024-01-17 21:12,2024-01-17 21:4
+         -4,33.0,min,train                                               
+      15 -A014,compressor_stuck_on,power_fridge,2024-01-18 06:29,2024-01-
+         -18 07:50,102.83,W,train                                        
+      16 -A015,compressor_stuck_on,power_fridge,2024-01-18 09:59,2024-01-
+         -18 11:13,128.1,W,train                                         
+      17 -A016,intrusion_motion,motion_hallway,2024-01-18 15:29,2024-01-1
+         -8 15:34,0.43,fraction_of_minutes,train                         
+      18 -A017,door_open_night,door_front,2024-01-19 04:16,2024-01-19 04:
+         -19,4.0,min,train                                               
+      19 -A018,door_left_open,door_front,2024-01-19 16:55,2024-01-19 17:1
+         -4,20.0,min,train                                               
+      20 -A019,heating_failure,temp_living_room,2024-01-20 08:24,2024-01-
+         -20 12:48,0.66,degC_per_hour,train                              
+      21 -A020,temp_spike,temp_living_room,2024-01-21 01:55,2024-01-21 01
+         -:56,3.72,degC,train                                            
+      22 -A021,heating_failure,temp_living_room,2024-01-21 17:43,2024-01-
+         -21 21:55,0.65,degC_per_hour,train                              
+      23 -A022,door_open_night,door_front,2024-01-22 04:39,2024-01-22 04:
+         -40,2.0,min,val                                                 
+      24 -A023,fridge_power_loss,power_fridge,2024-01-22 18:08,2024-01-22
+         - 19:52,0.23,W,val                                              
+      25 -A024,compressor_stuck_on,power_fridge,2024-01-23 00:44,2024-01-
+         -23 01:44,116.66,W,val                                          
+      26 -A025,fridge_power_loss,power_fridge,2024-01-23 06:07,2024-01-23
+         - 08:03,0.3,W,val                                               
+      27 -A026,intrusion_motion,motion_hallway,2024-01-24 15:12,2024-01-2
+         -4 15:19,0.34,fraction_of_minutes,val                           
+      28 -A027,door_left_open,door_front,2024-01-24 20:50,2024-01-24 21:3
+         -6,47.0,min,val                                                 
+      29 -A028,door_open_night,door_front,2024-01-25 03:00,2024-01-25 03:
+         -02,3.0,min,val                                                 
+      30 -A029,temp_spike,temp_living_room,2024-01-25 05:46,2024-01-25 05
+         -:46,6.98,degC,val                                              
+      31 -A030,intrusion_motion,motion_hallway,2024-01-25 16:53,2024-01-2
+         -5 17:21,0.42,fraction_of_minutes,val                           
+      32 -A031,temp_spike,temp_living_room,2024-01-26 05:48,2024-01-26 05
+         -:48,5.65,degC,val                                              
+      33 -A032,heating_failure,temp_living_room,2024-01-26 10:17,2024-01-
+         -26 14:15,0.85,degC_per_hour,val                                
+      34 -A033,compressor_stuck_on,power_fridge,2024-01-27 04:58,2024-01-
+         -27 06:03,104.21,W,val                                          
+      35 -A034,heating_failure,temp_living_room,2024-01-28 07:57,2024-01-
+         -28 12:10,0.9,degC_per_hour,val                                 
+      36 -A035,door_left_open,door_front,2024-01-28 19:56,2024-01-28 20:5
+         -4,59.0,min,val                                                 
+      37 -A036,door_open_night,door_front,2024-01-29 03:48,2024-01-29 03:
+         -52,5.0,min,test                                                
+      38 -A037,fridge_power_loss,power_fridge,2024-01-29 09:15,2024-01-29
+         - 10:07,0.01,W,test                                             
+      39 -A038,heating_failure,temp_living_room,2024-01-29 13:50,2024-01-
+         -29 18:34,0.69,degC_per_hour,test                               
+      40 -A039,door_left_open,door_front,2024-01-30 07:13,2024-01-30 07:4
+         -6,34.0,min,test                                                
+     … 60 more lines (ctrl+o to expand)
+  ⎿  Updated data\generation_log.csv (+37 -37)
+       1 -kind,sensor_id,start,end,split                                 
+       2 -night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+         -02:13,train                                                    
+       3 -sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+         -n                                                              
+       4 -night_bathroom_trip,motion_hallway,2024-01-09 04:51,2024-01-09 
+         -04:53,train                                                    
+       5 -sensor_outage,power_fridge,2024-01-12 20:12,2024-01-12 21:10,tr
+         -ain                                                            
+       6 -night_bathroom_trip,motion_hallway,2024-01-14 01:34,2024-01-14 
+         -01:37,train                                                    
+       7 -night_bathroom_trip,motion_hallway,2024-01-15 04:01,2024-01-15 
+         -04:02,train                                                    
+       8 -duplicate_row,all,2024-01-15 19:32,2024-01-15 19:32,train      
+       9 -sensor_outage,temp_living_room,2024-01-16 02:05,2024-01-16 04:0
+         -3,train                                                        
+      10 -sensor_outage,motion_hallway,2024-01-16 05:47,2024-01-16 07:03,
+         -train                                                          
+      11 -duplicate_row,all,2024-01-17 11:55,2024-01-17 11:55,train      
+      12 -night_bathroom_trip,motion_hallway,2024-01-19 03:16,2024-01-19 
+         -03:17,train                                                    
+      13 -night_bathroom_trip,motion_hallway,2024-01-20 03:11,2024-01-20 
+         -03:11,train                                                    
+      14 -weekend_guests,motion_hallway;door_front,2024-01-20 20:01,2024-
+         -01-20 23:06,train                                              
+      15 -hub_outage,all,2024-01-21 09:39,2024-01-21 10:04,train         
+      16 -night_bathroom_trip,motion_hallway,2024-01-22 04:02,2024-01-22 
+         -04:03,val                                                      
+      17 -sensor_outage,motion_hallway,2024-01-22 13:52,2024-01-22 14:08,
+         -val                                                            
+      18 -night_bathroom_trip,motion_hallway,2024-01-23 04:52,2024-01-23 
+         -04:52,val                                                      
+      19 -duplicate_row,all,2024-01-23 11:55,2024-01-23 11:55,val        
+      20 -hub_outage,all,2024-01-25 01:49,2024-01-25 02:28,val           
+      21 -sensor_outage,temp_living_room,2024-01-25 08:34,2024-01-25 09:2
+         -9,val                                                          
+      22 -night_bathroom_trip,motion_hallway,2024-01-26 03:49,2024-01-26 
+         -03:51,val                                                      
+      23 -sensor_outage,door_front,2024-01-26 16:18,2024-01-26 16:57,val 
+      24 -duplicate_row,all,2024-01-27 09:00,2024-01-27 09:00,val        
+      25 -sensor_outage,power_fridge,2024-01-27 10:42,2024-01-27 11:42,va
+         -l                                                              
+      26 -weekend_guests,motion_hallway;door_front,2024-01-27 20:03,2024-
+         -01-27 23:15,val                                                
+      27 -sensor_outage,temp_living_room,2024-01-30 02:44,2024-01-30 04:3
+         -7,test                                                         
+      28 -duplicate_row,all,2024-01-31 15:56,2024-01-31 15:56,test       
+      29 -hub_outage,all,2024-02-01 15:11,2024-02-01 15:43,test          
+      30 -sensor_outage,power_fridge,2024-02-01 18:26,2024-02-01 19:38,te
+         -st                                                             
+      31 -night_bathroom_trip,motion_hallway,2024-02-02 03:27,2024-02-02 
+         -03:27,test                                                     
+      32 -duplicate_row,all,2024-02-02 06:36,2024-02-02 06:36,test       
+      33 -night_bathroom_trip,motion_hallway,2024-02-03 01:21,2024-02-03 
+         -01:23,test                                                     
+      34 -night_bathroom_trip,motion_hallway,2024-02-03 02:31,2024-02-03 
+         -02:34,test                                                     
+      35 -sensor_outage,motion_hallway,2024-02-03 14:50,2024-02-03 15:51,
+         -test                                                           
+      36 -weekend_guests,motion_hallway;door_front,2024-02-03 19:10,2024-
+         -02-03 22:42,test                                               
+      37 -sensor_outage,door_front,2024-02-04 15:36,2024-02-04 16:14,test
+       1 +kind,sensor_id,start,end,split                                 
+       2 +night_bathroom_trip,motion_hallway,2024-01-08 02:12,2024-01-08 
+         +02:13,train                                                    
+       3 +sensor_outage,door_front,2024-01-08 07:38,2024-01-08 08:19,trai
+         +n                                                              
+     … 34 more lines (ctrl+o to expand)
+  ⎿  … 3 more files changed
+  ⎿  (timeout 10m)
+
+● The rolling mean cut noise significantly, but it drags temperature spikes into
+  the rate for up to 30 minutes afterward (seen in the −2.51 °C/h minimum).
+  I'll switch to a rolling median, since it ignores brief 1–3 minute spikes.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && sed -i 's/    smooth =
+      temp.rolling(TEMP_SMOOTH_MINUTES, min_periods=10).mean()/    smooth =
+      temp.rolling(TEMP…)
+  ⎿  28:TEMP_SMOOTH_MINUTES = 15     # rolling median before computing temp
+     erature rates
+     185:    return ctx.groupby(["day_type", "hour"])[cfg.TEMP].median().re
+     … +15 lines (ctrl+o to expand)
+  ⎿  Updated features.py (+3 -3)
+      25  }
+      26  FFILL_LIMIT_MINUTES = 2      # short gaps filled forward; longe
+          r gaps = sensor offline
+      27  WARMUP_MINUTES = 180         # history prepended from the previ
+          ous split (longest lookback + margin)
+      28 -TEMP_SMOOTH_MINUTES = 15     # rolling mean before computing te
+         -mperature rates                                                
+      28 +TEMP_SMOOTH_MINUTES = 15     # rolling median before computing 
+         +temperature rates                                              
+      29  
+      30  FRIDGE_IDLE_MAX_W = 50.0     # below: idle
+      31  FRIDGE_DEFROST_MIN_W = 200.0 # at/above: defrost; in between: r
+          unning
+     ...
+      204  def temperature_features(df, baseline):
+      205      """Deviation from the train baseline (raw, keeps spikes) a
+           nd smoothed rate of change (degC/hour).
+      206  
+      207 -    Rates compare 15-min rolling means instead of single readi
+          -ngs, which cuts sensor noise.                                 
+      207 +    Rates compare 15-min rolling medians instead of single rea
+          +dings: cuts noise and ignores 1-3 min spikes.                 
+      208      """
+      209      temp = df[cfg.TEMP]
+      210 -    smooth = temp.rolling(TEMP_SMOOTH_MINUTES, min_periods=10)
+          -.mean()                                                       
+      210 +    smooth = temp.rolling(TEMP_SMOOTH_MINUTES, min_periods=10)
+          +.median()                                                     
+      211      baseline_values = lookup_temp_baseline(df, baseline)
+      212      return pd.DataFrame({
+      213          "temp_baseline": baseline_values,
+  ⎿  (timeout 10m)
+
+● The median wins out—slightly noisier than the mean (0.18 vs 0.14 °C/h) but
+  without the spike artifacts, keeping normal-minute minimums at −1.24 instead
+  of −2.51 and giving accurate fall rates during heating failures. I'll re-run
+  the notebook now.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -m
+      nbconvert --to notebook --execute --inplace analysis.ipynb 2>&1 | grep -i
+      "error\|Writ…)
+  ⎿  [NbConvertApp] Writing 897387 bytes to analysis.ipynb
+     errors: [] | findings cell: True
+  ⎿  4 files changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Read 2 files (ctrl+o to expand)
+
+● The start-up artifact is resolved—Mon 8 Jan now begins around 20.3 °C and
+  cools normally, and the temperature tail in plot 3 shrank from −2.3 to about
+  −1.9 °C. I'll confirm the exact numbers to keep the findings accurate.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+     [NbConvertApp] Writing 897428 bytes to analysis.ipynb
+     1
+  ⎿  Updated analysis.ipynb (+62 -62)
+      2   "cells": [
+      3    {
+      4     "cell_type": "markdown",
+      5 -   "id": "2ff7253c",                                            
+      5 +   "id": "d488613c",                                            
+      6     "metadata": {},
+      7     "source": [
+      8      "# Cleaning & EDA\n",
+     ...
+      17    },
+      18    {
+      19     "cell_type": "markdown",
+      20 -   "id": "1982c448",                                           
+      20 +   "id": "0032e86e",                                           
+      21     "metadata": {},
+      22     "source": [
+      23      "## 1. Setup"
+     ...
+      26    {
+      27     "cell_type": "code",
+      28     "execution_count": 1,
+      29 -   "id": "f52d38e5",                                           
+      29 +   "id": "9dc4909b",                                           
+      30     "metadata": {
+      31      "execution": {
+      32 -     "iopub.execute_input": "2026-10-24T07:12:13.618520Z",     
+      33 -     "iopub.status.busy": "2026-10-24T07:12:13.618163Z",       
+      34 -     "iopub.status.idle": "2026-10-24T07:12:14.583155Z",       
+      35 -     "shell.execute_reply": "2026-10-24T07:12:14.582024Z"      
+      32 +     "iopub.execute_input": "2026-10-24T07:12:43.162526Z",     
+      33 +     "iopub.status.busy": "2026-10-24T07:12:43.162301Z",       
+      34 +     "iopub.status.idle": "2026-10-24T07:12:44.333479Z",       
+      35 +     "shell.execute_reply": "2026-10-24T07:12:44.332397Z"      
+      36      }
+      37     },
+      38     "outputs": [],
+     ...
+      69    },
+      70    {
+      71     "cell_type": "markdown",
+      72 -   "id": "f44da3ec",                                           
+      72 +   "id": "0e465c0b",                                           
+      73     "metadata": {},
+     … 236 more lines (ctrl+o to expand)
+  ⎿  (timeout 10m)
+
+● Now design.md: the start-up fix, the warm-up, the smoothing, and the corrected
+  temperature numbers.
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      247  
+      248  | Sensor | Observation (train) | Implication for detection |
+      249  |---|---|---|
+      250 -| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Spikes
+          - at ±3.5–4.3 °C deviation. Heating failure + recovery spans −2
+          -.2 to 0 °C, overlapping the normal tail | Deviation catches sp
+          -ikes. Heating failure needs duration / rate in context |      
+      250 +| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Spikes
+          + at −4.3 / +3.4 to +3.7 °C deviation vs normal −1.8 to +1.5 °C
+          +. Heating failure + recovery spans −2.1 to +0.2 °C, overlappin
+          +g normal | Deviation catches spikes. Heating failure needs dur
+          +ation / rate in context |                                     
+      251  | Fridge | No daily pattern. Stuck-on power equals normal runn
+           ing. Power loss ≤ 0.6 W vs idle ≥ 1.1 W | **Mode duration** se
+           parates: normal idle ≤ 30, running ≤ 22 min vs anomalous 72–13
+           7 / 77–93 min |
+      252  | Motion | ~0 Tue–Thu 09–16 h. Intrusion counts overlap normal
+            home activity | Needs context (expected empty house) |
+      253  | Door | Normal openings ≤ 4 min, `door_left_open` up to 41 mi
+           n. Night openings have normal duration | Duration for left-ope
+           n; time of day for night |
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      230  
+      231  | Sensor | Features |
+      232  |---|---|
+      233 -| Temperature | **Deviation from the train baseline** (median 
+          -for this hour × day type), rate of change over 15 and 60 min (
+          -°C/h) |                                                       
+      233 +| Temperature | **Deviation from the train baseline** (median 
+          +for this hour × day type, on raw readings so spikes stay visib
+          +le). Rate of change over 15 and 60 min (°C/h), computed on a *
+          +*15-min rolling median** |                                    
+      234  | Fridge | Mode from **fixed thresholds**: idle < 50 W, runnin
+           g 50–200 W, defrost ≥ 200 W (not tuned). Minutes in current mo
+           de |
+      235  | Motion | Motion minutes in the last 15 and 60 min |
+      236  | Door | Minutes the door has been open |
+
+● Update(docs\design.md)
+  ⎿  Added 8 lines
+      241    - This is the first learned parameter.
+      242  - **Fridge mode thresholds** are fixed from the physics (idle 
+           ≤ ~5 W, compressor 100–130 W, defrost ~300 W), with no tuning.
+            Power loss appears as idle mode with an unusually long run an
+           d a near-0 W value.
+      243  - **No scaling:** the rules use physical units and Isolation F
+           orest is scale-invariant. If a later model needs scaling, it i
+           s fit on train only.
+      244 +- **Smoothed temperature rate:** a single-reading difference o
+          +ver 15 min is dominated by sensor noise (std 0.56 °C/h on stab
+          +le normal minutes). Comparing 15-min rolling **medians** gives
+          + a std of 0.18 °C/h.                                          
+      245 +  - A rolling mean was slightly smoother (0.14 °C/h), but a sp
+          +ike leaked into the rate for up to 30 min afterwards (normal-m
+          +inute minimum −2.51 °C/h). The median ignores 1–3 min spikes (
+          +minimum −1.24 °C/h).                                          
+      246 +  - With the median, `temp_rate_60` during a heating failure r
+          +eads close to the true fall rate (−0.62 to −0.66 vs 0.65–0.69 
+          +°C/h).                                                        
+      247 +- **Split-start warm-up:** val/test features are built with th
+          +e last 180 min of the previous split prepended (`split_feature
+          +s`), then trimmed.                                            
+      248 +  - Verified: the first hour of val and test is identical to o
+          +ne continuous run over all 28 days. Without warm-up it had 84 
+          +NaN and 103–120 wrong feature cells.                          
+      249 +  - The warm-up rows are past data (a live stream has them) an
+          +d are never used to fit anything.                             
+      250 +  - Train has no earlier split, so its first hour stays withou
+          +t history.                                                    
+      251 +- **Generator start-up fix:** the temperature simulation now s
+          +tarts from a settled midnight value (a burn-in run of day 1's 
+          +schedule) instead of the 18 °C setback. Mon 8 Jan 00–07 h now 
+          +averages 19.33 °C vs 19.36 °C on other nights (was ~18 °C). It
+          + uses no random numbers, so all other data and every label are
+          + unchanged.                                                   
+      252  
+      253  ### EDA findings (from `analysis.ipynb`, plots in `outputs/eda
+           /`)
+      254  - **Data quality:** per split there are 2 duplicate rows, 1 hu
+           b outage (26 / 40 / 33 missing rows) and 0 out-of-order timest
+           amps. Cleaning detects exactly 2 offline periods per sensor pe
+           r split, matching the generation log. Offline minutes = logged
+            minutes − 2 per outage (the forward fill).
+
+● Update(docs\design.md)
+  ⎿  Added 6 lines
+      282    - intrusions always have ≥2 motion minutes
+      283  
+      284    Mention this as part of the process.
+      285 +- **Cleaning & features:**                                    
+      286 +  - Causal throughout; only short gaps are filled (2 min); out
+          +liers are kept.                                               
+      287 +  - The train-only temperature baseline is the only learned pr
+          +eprocessing parameter.                                        
+      288 +  - Fridge modes come from fixed thresholds.                  
+      289 +  - The temperature rate uses a rolling median.               
+      290 +  - Val/test get a 180-min warm-up from the previous split.   
+      291  - **Heating failure is contextual:** normal setback cooling (~
+           0.6 °C/h at its start) overlaps the slowest failures. The rate
+            of fall alone is not enough; the detector needs the context (
+           target 21 °C, awake and home).
+      292  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      293  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+● I've made all three changes, regenerated the data, re-run every check and the
+  notebook, and updated design.md. The notebook ran with no errors; plot 1 now
+  shows Mon 8 Jan starting at about 20.3 °C and cooling like every other night.
+
+  Results of the three changes
+
+  Change: Start-up fix
+  Check: Mon 8 Jan, 00–07 h
+  Result: Averages 19.33 °C, against 19.36 °C on other nights (it was about 18
+  °C)
+  ────────────────────────────────────────
+  Change:
+  Check: Side effects
+  Result: None. The warm-up uses no random numbers, so all other data and every
+  label are unchanged.
+  ────────────────────────────────────────
+  Change: First hour of val/test
+  Check: Compared with one continuous 28-day run
+  Result: Identical for both. Without the warm-up, the first hour had 84 missing
+
+  and 103–120 wrong feature values.
+  ────────────────────────────────────────
+  Change: Smoother temp_rate_15
+  Check: Noise on stable normal minutes
+  Result: 0.56 → 0.18 °C/h
+  ────────────────────────────────────────
+  Change:
+  Check: Effect of a spike on the rate
+  Result: I chose a rolling median over a rolling mean. The mean was slightly
+  smoother (0.14 °C/h), but it carried each spike into the rate for 30 min
+  (normal minimum −2.51 °C/h). With the median it's −1.24 °C/h.
+  ────────────────────────────────────────
+  Change:
+  Check: Accuracy
+  Result: temp_rate_60 during a heating failure reads −0.62 to −0.66 °C/h,
+  against true fall rates of 0.65–0.69
+
+  The other checks are unchanged:
+  - Fridge idle never below 1.1 W, against power loss at most 0.6 W.
+  - No motion before any arrival to an empty house (0 of 11).
+  - 7 stray motion minutes over 12 empty days.
+  - Every outage detected, with offline minutes matching the generation log.
+
+  Anomaly statistics
+
+  ┌────────┬────────────────────────┬──────────┬────────────────┬──────────┐
+  │        │                        │ Train /  │  Shortest /    │  Total   │
+  │ Sensor │          Type          │  Val /   │   median /     │ minutes  │
+  │        │                        │   Test   │ longest (min)  │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ temp   │ temp_spike             │ 3 / 2 /  │ 1 / 1 / 3      │ 11       │
+  │        │                        │ 2        │                │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ temp   │ heating_failure (with  │ 3 / 2 /  │ 238 / 254 /    │ 1,817    │
+  │        │ recovery)              │ 2        │ 285            │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ fridge │ fridge_power_loss      │ 3 / 2 /  │ 53 / 103 / 117 │ 602      │
+  │        │                        │ 2        │                │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ fridge │ compressor_stuck_on    │ 3 / 2 /  │ 61 / 74 / 82   │ 505      │
+  │        │                        │ 2        │                │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ motion │ intrusion_motion       │ 3 / 2 /  │ 6 / 21 / 30    │ 139      │
+  │        │                        │ 2        │                │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ door   │ door_open_night        │ 3 / 2 /  │ 2 / 5 / 5      │ 29       │
+  │        │                        │ 2        │                │          │
+  ├────────┼────────────────────────┼──────────┼────────────────┼──────────┤
+  │ door   │ door_left_open         │ 3 / 2 /  │ 20 / 41 / 59   │ 290      │
+  │        │                        │ 2        │                │          │
+  └────────┴────────────────────────┴──────────┴────────────────┴──────────┘
+
+  ┌───────┬───────────┬───────────────────┬─────────────────────────┐
+  │ Split │ Anomalies │ Anomalous minutes │ % of split (any sensor) │
+  ├───────┼───────────┼───────────────────┼─────────────────────────┤
+  │ Train │ 21        │ 1,478             │ 7.33%                   │
+  ├───────┼───────────┼───────────────────┼─────────────────────────┤
+  │ Val   │ 14        │ 992               │ 9.84%                   │
+  ├───────┼───────────┼───────────────────┼─────────────────────────┤
+  │ Test  │ 14        │ 923               │ 9.16%                   │
+  └───────┴───────────┴───────────────────┴─────────────────────────┘
+
+  The temperature findings now use exact numbers: normal deviation runs from
+  −1.8 to +1.5 °C, spikes are at −4.3 and +3.4 to +3.7 °C, and heating failure
+  spans −2.1 to +0.2 °C.
+
+  Before Stage 5: please export this session (/export) into ai_transcripts/. The
+  changes from this stage are uncommitted: features.py, analysis.ipynb,
+  outputs/eda/, design.md, and the regenerated data. Want me to commit them?
+  Once you've approved Stage 4, we'll move on to model comparison.
+
+✻ Sautéed for 2m 48s · done 3:13 PM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, and Stage 4 (cleaning and EDA) is finished and checked. Next, please export the transcript and approve Stage 4, then I'll commit and start model comparison. (disable recaps in /config)
+
+❯ The reviewer flagged four issueswith the features. I checked and approve.     
+  Findings:                                                                     
+  1. Medium-High: no door-and-motion feature for intrusion (contradicts the     
+  design)                                                                       
+  - Reason: Stage 1 defines intrusion as cross-sensor: "daytime motion on       
+  office day, no door entry". The features only give motion counts plus hour    
+  and day type, so nothing links motion to door activity. An intrusion near the 
+  return window (e.g. A030, Thu 16:53–17:21) looks the same as an early return  
+  home, which is also motion at that hour but comes with a door opening. Your   
+  own EDA notes that intrusion motion counts overlap normal home activity.      
+  - Fix: In features.py, add door_features → minutes_since_door_open, the       
+  minutes since the door last read 1 (causal; NaN until the first opening).     
+  Then motion with no recent door opening during expected-empty hours can be    
+  identified.                                                                   
+                                                                                
+  2. Medium: weak spikes are hidden by the context deviation (anomaly can't be  
+  identified)                                                                   
+  - Reason: Spikes are only visible through temp_dev (reading minus the hourly  
+  baseline). Normal temp_dev already ranges from −1.8 to +1.5 °C, so a minimum  
+  +3 °C spike during a warm-up lag (dev −1.8) lands at +1.2, inside the normal  
+  range. The temperature rate deliberately ignores spikes, so no feature        
+  isolates them.                                                                
+  - Fix: In temperature_features, add "temp_resid": temp - smooth (the reading  
+  minus the 15-min rolling median, causal). Its normal spread is about the 0.1  
+  °C sensor noise, so any spike of 3 °C or more stands out whatever the         
+  context.                                                                      
+                                                                                
+  3. Medium: the temperature baseline is heavily contaminated in some hours     
+  (contradicts the design claim)                                                
+  - Reason: The design says the median is robust because only about 4% of       
+  minutes are contaminated. But train has just 4 weekend days, and 2 of them    
+  (Sun 14 and Sun 21) have heating failures over 17–20 h. Half the inputs to    
+  those hours' medians are failure minutes. The weekend baseline at 18–19 h is  
+  about 0.2 °C below mon_fri (21.03/20.98 vs 21.22/21.19), which makes          
+  weekend-evening failures harder to see.                                       
+  - Fix: In day_type, keep three types for features but fit the baseline on two 
+  (tue_thu vs occupied = Mon/Fri + weekend). Your baseline table shows those    
+  two groups behave almost identically, and pooling gives 8 days per hour, so   
+  at most 2 of 8 are contaminated. Then update the robustness sentence in       
+  design.md.                                                                    
+                                                                                
+  4. Medium: label-derived numbers could leak into detector thresholds (leakage 
+  risk)                                                                         
+  - Reason: The EDA table in design.md gives separation boundaries split by     
+  training labels (idle ≤ 30 vs 72–137 min, running ≤ 22 vs 77–93 min, door ≤ 4 
+  vs 41 min). If the next stage copies these into thresholds, labels become a   
+  training input. That contradicts "labels used only for evaluation".           
+  - Fix: In design.md Stage 4, add: "Label-split statistics are descriptive     
+  only. Detector thresholds come from physics, or from unlabelled train         
+  distributions (e.g. high quantiles), and are tuned on val."                   
+
+● I'll apply all four as written, with one small change to #1, explained below.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(features.py)
+  ⎿  Added 15 lines, removed 5 lines
+      168      return np.select([dow.isin([1, 2, 3]), dow.isin([0, 4])], 
+           ["tue_thu", "mon_fri"], "weekend")
+      169  
+      170  
+      171 +def baseline_group(day_types):                                
+      172 +    """Two groups for the temperature baseline: tue_thu (eco m
+          +ode) vs occupied (Mon/Fri + weekend)."""                      
+      173 +    return np.where(np.asarray(day_types) == "tue_thu", "tue_t
+          +hu", "occupied")                                              
+      174 +                                                              
+      175 +                                                              
+      176  def add_time_context(df):
+      172 -    """Hour of day and day type."""                           
+      177 +    """Hour of day, day type, and baseline group."""          
+      178      df = df.copy()
+      179      df["hour"] = df.index.hour
+      180      df["day_type"] = day_type(df.index)
+      181 +    df["baseline_group"] = baseline_group(df["day_type"])     
+      182      return df
+      183  
+      184  
+     ...
+      186  # Learned baseline (fit on train only)
+      187  # ============================================================
+      188  def fit_temp_baseline(train_clean):
+      183 -    """Median temperature per (day_type, hour) on train. No la
+          -bels used."""                                                 
+      189 +    """Median temperature per (baseline_group, hour) on train.
+          + No labels used.                                              
+      190 +                                                              
+      191 +    Pooling Mon/Fri with weekends gives 8 train days per hour 
+          +instead of 4, so a                                            
+      192 +    heating failure on one day contaminates at most a minority
+          + of each median.                                              
+      193 +    """                                                       
+      194      ctx = add_time_context(train_clean)
+      185 -    return ctx.groupby(["day_type", "hour"])[cfg.TEMP].median(
+          -).rename("temp_baseline")                                     
+      195 +    return ctx.groupby(["baseline_group", "hour"])[cfg.TEMP].m
+          +edian().rename("temp_baseline")                               
+      196  
+      197  
+      198  def lookup_temp_baseline(df, baseline):
+      189 -    """Baseline value for every row (df must have day_type and
+          - hour)."""                                                    
+      190 -    keys = pd.MultiIndex.from_arrays([df["day_type"], df["hour
+          -"]])                                                          
+      199 +    """Baseline value for every row (df must have baseline_gro
+          +up and hour)."""                                              
+      200 +    keys = pd.MultiIndex.from_arrays([df["baseline_group"], df
+          +["hour"]])                                                    
+      201      return baseline.reindex(keys).to_numpy()
+      202  
+      203  
+
+● Update(features.py)
+  ⎿  Added 5 lines, removed 2 lines
+      212  
+      213  
+      214  def temperature_features(df, baseline):
+      215 -    """Deviation from the train baseline (raw, keeps spikes) a
+          -nd smoothed rate of change (degC/hour).                       
+      215 +    """Deviation from the train baseline, residual from recent
+          + readings, and smoothed rate (degC/hour).                     
+      216  
+      217 -    Rates compare 15-min rolling medians instead of single rea
+          -dings: cuts noise and ignores 1-3 min spikes.                 
+      217 +    - temp_dev: reading minus the hour/day baseline (context l
+          +evel).                                                        
+      218 +    - temp_resid: reading minus the 15-min rolling median (iso
+          +lates 1-3 min spikes in any context).                         
+      219 +    - Rates compare 15-min rolling medians instead of single r
+          +eadings: cuts noise and ignores spikes.                       
+      220      """
+      221      temp = df[cfg.TEMP]
+      222      smooth = temp.rolling(TEMP_SMOOTH_MINUTES, min_periods=10)
+           .median()
+     ...
+      224      return pd.DataFrame({
+      225          "temp_baseline": baseline_values,
+      226          "temp_dev": temp - baseline_values,
+      227 +        "temp_resid": temp - smooth,                          
+      228          "temp_rate_15": (smooth - smooth.shift(15)) * (60 / 15
+           ),
+      229          "temp_rate_60": (smooth - smooth.shift(60)),
+      230      }, index=df.index)
+
+● Update(features.py)
+  ⎿  Added 16 lines, removed 2 lines
+      252      }, index=df.index)
+      253  
+      254  
+      255 +def minutes_since(event, cap):                                
+      256 +    """Minutes since `event` was last True (0 while True), cap
+          +ped at `cap`.                                                 
+      257 +                                                              
+      258 +    No event within the history -> cap, so the value never dep
+          +ends on how much                                              
+      259 +    history happens to be loaded (keeps warm-up and continuous
+          + runs identical).                                             
+      260 +    """                                                       
+      261 +    position = pd.Series(np.arange(len(event), dtype=float), i
+          +ndex=event.index)                                             
+      262 +    last_seen = position.where(event.fillna(False).astype(bool
+          +)).ffill()                                                    
+      263 +    return (position - last_seen).fillna(cap).clip(upper=cap) 
+      264 +                                                              
+      265 +                                                              
+      266  def door_features(df):
+      256 -    """Minutes the door has been open (0 when closed)."""     
+      267 +    """Minutes the door has been open (0 when closed) and minu
+          +tes since it was last open."""                                
+      268      door = df[cfg.DOOR]
+      269      open_minutes = run_length(door).where(door == 1, 0.0)
+      259 -    return pd.DataFrame({"door_open_minutes": open_minutes.whe
+          -re(door.notna())}, index=df.index)                            
+      270 +    return pd.DataFrame({                                     
+      271 +        "door_open_minutes": open_minutes.where(door.notna()),
+      272 +        "minutes_since_door_open": minutes_since(door == 1, ca
+          +p=WARMUP_MINUTES),                                            
+      273 +    }, index=df.index)                                        
+      274  
+      275  
+      276  def build_features(cleaned, baseline):
+
+● Now I'll check each fix against the data.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All four fixes check out, and the new features match the continuous run
+  exactly in the first hour of val and test. Next I'll re-derive the temperature
+  numbers in the findings since the new baseline changes them.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+     [NbConvertApp] Writing 898629 bytes to analysis.ipynb
+     errors: [] | resid note: True
+  ⎿  3 files changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+● Now design.md:
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      230  
+      231  | Sensor | Features |
+      232  |---|---|
+      233 -| Temperature | **Deviation from the train baseline** (median 
+          -for this hour × day type, on raw readings so spikes stay visib
+          -le). Rate of change over 15 and 60 min (°C/h), computed on a *
+          -*15-min rolling median** |                                    
+      233 +| Temperature | **Deviation from the train baseline** (`temp_d
+          +ev`, median for this hour × baseline group). **Residual from r
+          +ecent readings** (`temp_resid` = reading − 15-min rolling medi
+          +an). Rate of change over 15 and 60 min (°C/h), computed on the
+          + **15-min rolling median** |                                  
+      234  | Fridge | Mode from **fixed thresholds**: idle < 50 W, runnin
+           g 50–200 W, defrost ≥ 200 W (not tuned). Minutes in current mo
+           de |
+      235  | Motion | Motion minutes in the last 15 and 60 min |
+      236  | Door | Minutes the door has been open |
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      233  | Temperature | **Deviation from the train baseline** (`temp_d
+           ev`, median for this hour × baseline group). **Residual from r
+           ecent readings** (`temp_resid` = reading − 15-min rolling medi
+           an). Rate of change over 15 and 60 min (°C/h), computed on the
+            **15-min rolling median** |
+      234  | Fridge | Mode from **fixed thresholds**: idle < 50 W, runnin
+           g 50–200 W, defrost ≥ 200 W (not tuned). Minutes in current mo
+           de |
+      235  | Motion | Motion minutes in the last 15 and 60 min |
+      236 -| Door | Minutes the door has been open |                     
+      236 +| Door | Minutes the door has been open. **Minutes since the d
+          +oor was last open** (capped at 180 min) |                     
+      237  | All | Hour of day, day type (`tue_thu`, `mon_fri`, `weekend`
+           ) |
+      238  
+      239  - **Temperature baseline:** the thermostat target (21 °C) is n
+           ot observed by any sensor, so the expected level is learned. I
+           t is the median temperature per hour × day type on **train onl
+           y**, fit once and then applied unchanged to val/test.
+
+● Update(docs\design.md)
+  ⎿  Added 13 lines, removed 3 lines
+      236  | Door | Minutes the door has been open. **Minutes since the d
+           oor was last open** (capped at 180 min) |
+      237  | All | Hour of day, day type (`tue_thu`, `mon_fri`, `weekend`
+           ) |
+      238  
+      239 -- **Temperature baseline:** the thermostat target (21 °C) is n
+          -ot observed by any sensor, so the expected level is learned. I
+          -t is the median temperature per hour × day type on **train onl
+          -y**, fit once and then applied unchanged to val/test.         
+      240 -  - It uses the median **without labels**, because a real syst
+          -em has no labels. The median is robust to the ~4% contaminated
+          - minutes.                                                     
+      241 -  - This is the first learned parameter.                      
+      239 +- **Temperature baseline:** the thermostat target (21 °C) is n
+          +ot observed by any sensor, so the expected level is learned. I
+          +t is the median temperature per hour × **baseline group** on *
+          +*train only**, fit once and then applied unchanged to val/test
+          +.                                                             
+      240 +  - **Baseline groups:** `tue_thu` (eco mode) vs `occupied` (M
+          +on/Fri + weekend). The three day types are kept for the other 
+          +features.                                                     
+      241 +  - **Why pooled:** with 3 day types, train has only 4 weekend
+          + days, and 2 of them have heating failures. Up to **50%** of t
+          +he minutes in some weekend-evening medians were failure minute
+          +s, which pulled the weekend 18–19 h baseline ~0.2 °C low. Pool
+          +ing gives 8 days per hour; the worst cell is now **25%** conta
+          +minated (occupied, 18 h). The occupied 18–19 h baseline is 21.
+          +17 / 21.14 °C.                                                
+      242 +  - It uses the median **without labels**, because a real syst
+          +em has no labels.                                             
+      243 +  - This is the only learned preprocessing parameter.         
+      244 +- **Spike residual (`temp_resid`):** `temp_dev` alone can hide
+          + a weak spike (e.g. +3 °C during a warm-up lag at −1.8 °C land
+          +s inside the normal range). The residual from the 15-min rolli
+          +ng median is independent of context.                          
+      245 +  - Normal train: std 0.12 °C, range −0.46 to +0.60 °C.       
+      246 +  - Train spikes: −4.11, +3.62, +3.75 / +3.57 °C.             
+      247 +- **Cross-sensor door link (`minutes_since_door_open`):** intr
+          +usion is defined as motion without door entry, so motion needs
+          + a link to door activity.                                     
+      248 +  - Capped at 180 min (= warm-up length), so the value never d
+          +epends on how much history is loaded. The reviewer suggested N
+          +aN until the first opening; the cap keeps warm-up and continuo
+          +us runs identical.                                            
+      249 +  - Train intrusion motion minutes: 95–180 min since the door 
+          +was last open.                                                
+      250 +  - Normal motion in Tue–Thu 09–17 h: 28 of 49 minutes are ≤ 5
+          + min after a door opening (returns home). 5 minutes are > 30 m
+          +in after one (3 stray triggers, 2 at 17:58–17:59 after an earl
+          +ier return).                                                  
+      251 +- **Label-split statistics are descriptive only.** Detector th
+          +resholds come from physics, or from unlabelled train distribut
+          +ions (e.g. high quantiles), and are tuned on val. The label-sp
+          +lit numbers in the EDA findings (e.g. idle ≤ 30 vs 72–137 min)
+          + must not be copied into thresholds.                          
+      252  - **Fridge mode thresholds** are fixed from the physics (idle 
+           ≤ ~5 W, compressor 100–130 W, defrost ~300 W), with no tuning.
+            Power loss appears as idle mode with an unusually long run an
+           d a near-0 W value.
+      253  - **No scaling:** the rules use physical units and Isolation F
+           orest is scale-invariant. If a later model needs scaling, it i
+           s fit on train only.
+      254  - **Smoothed temperature rate:** a single-reading difference o
+           ver 15 min is dominated by sensor noise (std 0.56 °C/h on stab
+           le normal minutes). Comparing 15-min rolling **medians** gives
+            a std of 0.18 °C/h.
+
+● Update(docs\design.md)
+  ⎿  Added 2 lines, removed 1 line
+      265  
+      266  | Sensor | Observation (train) | Implication for detection |
+      267  |---|---|---|
+      268 -| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Spikes
+          - at −4.3 / +3.4 to +3.7 °C deviation vs normal −1.8 to +1.5 °C
+          -. Heating failure + recovery spans −2.1 to +0.2 °C, overlappin
+          -g normal | Deviation catches spikes. Heating failure needs dur
+          -ation / rate in context |                                     
+      268 +| Temperature | Tue–Thu daytime ~2 °C lower (eco mode). Train 
+          +spikes at −4.3 / +3.5 to +3.7 °C deviation vs normal −1.8 to +
+          +1.5 °C. Heating failure + recovery spans −2.1 to +0.1 °C, over
+          +lapping normal | `temp_resid` catches spikes in any context. H
+          +eating failure needs duration / rate in context |             
+      269 +| Motion (cross-sensor) | Intrusions happen 95–180 min after t
+          +he last door opening; most normal empty-hours motion is ≤ 5 mi
+          +n after one | `minutes_since_door_open` + expected-empty conte
+          +xt |                                                          
+      270  | Fridge | No daily pattern. Stuck-on power equals normal runn
+           ing. Power loss ≤ 0.6 W vs idle ≥ 1.1 W | **Mode duration** se
+           parates: normal idle ≤ 30, running ≤ 22 min vs anomalous 72–13
+           7 / 77–93 min |
+      271  | Motion | ~0 Tue–Thu 09–16 h. Intrusion counts overlap normal
+            home activity | Needs context (expected empty house) |
+      272  | Door | Normal openings ≤ 4 min, `door_left_open` up to 41 mi
+           n. Night openings have normal duration | Duration for left-ope
+           n; time of day for night |
+
+● Update(docs\design.md)
+  ⎿  Added 3 lines, removed 1 line
+      295    Mention this as part of the process.
+      296  - **Cleaning & features:**
+      297    - Causal throughout; only short gaps are filled (2 min); out
+           liers are kept.
+      298 -  - The train-only temperature baseline is the only learned pr
+          -eprocessing parameter.                                        
+      298 +  - The train-only temperature baseline (2 groups, pooled to l
+          +imit contamination) is the only learned preprocessing paramete
+          +r.                                                            
+      299 +  - `temp_resid` isolates spikes; `minutes_since_door_open` gi
+          +ves the cross-sensor intrusion link.                          
+      300 +  - Label-split statistics are descriptive only; thresholds ne
+          +ver come from labels.                                         
+      301    - Fridge modes come from fixed thresholds.
+      302    - The temperature rate uses a rolling median.
+      303    - Val/test get a 180-min warm-up from the previous split.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I've applied all four reviewer fixes, checked each against the data, re-run
+  the notebook with no errors, and updated design.md.
+
+  #: 1
+  Fix: New feature minutes_since_door_open
+  Result: Train intrusions happen 95–180 min after the last door opening. Of the
+
+  49 normal motion minutes in Tue–Thu 09–17 h, 28 are ≤ 5 min after a door
+  opening (people returning home). Only 5 are > 30 min after one: 3 stray
+  triggers, and 2 minutes at 17:58–17:59 after an earlier return.
+  ────────────────────────────────────────
+  #: 2
+  Fix: New feature temp_resid (reading minus the 15-min rolling median)
+  Result: Normal values: std 0.12 °C, range −0.46 to +0.60 °C. Train spikes:
+  −4.11, +3.62, +3.75 °C. That's a clear gap in any context, so a weak spike
+  during a warm-up can no longer hide.
+  ────────────────────────────────────────
+  #: 3
+  Fix: Baseline pooled into 2 groups (tue_thu vs occupied)
+  Result: Worst share of heating-failure minutes in any baseline hour: 50% → 
+  25%.
+  The occupied 18–19 h baseline is 21.17 / 21.14 °C, where weekends used to be
+  21.03 / 20.98. The 3 day types are kept for the other features.
+  ────────────────────────────────────────
+  #: 4
+  Fix: Rule in design.md: label-split statistics are descriptive only
+  Result: Thresholds will come from physics or from unlabelled train
+  distributions, tuned on val. The notebook findings now carry the same note.
+
+  One deviation from the reviewer's fix #1: minutes_since_door_open is capped at
+  180 min, the warm-up length, instead of being NaN until the first opening.
+  With NaN, the value at the start of val and test would depend on how much
+  history happened to be loaded. With the cap, the first hour of val and test
+  still matches the continuous run exactly. I re-checked this, and all 15
+  numeric features are identical.
+
+  Before Stage 5: please export this session into ai_transcripts/. These changes
+  are uncommitted: features.py, analysis.ipynb, outputs/eda/, design.md,
+  generate_data.py and data/. Want me to commit them? Once you've approved Stage
+  4, we'll start model comparison.
+
+✻ Baked for 1m 56s · done 3:23 PM
+
+※ recap: You're building a smart-home anomaly detection prototype, and Stage 4 (Cleaning & EDA) is finished with all four reviewer feature fixes applied and checked. Next: export the transcript, then approve Stage 4 and tell me whether to commit before model comparison. (disable recaps in /config)
+
+❯ Two more findings....                                                         
+  New findings                                                                  
+                                                                                
+  1. Medium: a door sensor that is offline is treated as "door closed" (false   
+  intrusion alarms in production)                                               
+  - Reason: In minutes_since, door == 1 is False for NaN, so the counter keeps  
+  climbing while the door sensor or hub is offline. If someone comes home       
+  during a door outage on a Tue–Thu, their motion appears with a large          
+  minutes_since_door_open and looks exactly like an intrusion. It also bypasses 
+  the design rule "offline sensor → skip detection", because the motion         
+  detector now depends on the door sensor. The current data doesn't trigger it: 
+  the door outages fall on Mon/Fri/Sun, and the Tue–Thu hub outages are at      
+  night or before the return window. A production stream would.                 
+  - Fix: In door_features, return NaN when the door was offline after its last  
+  opening:                                                                      
+                                                                                
+  last_off = position.where(door.isna()).ffill()                                
+                                                                                
+    Set minutes_since_door_open to NaN where last_off > last_open. Then add one 
+  line to design.md Stage 4: "Cross-sensor features are unknown (NaN) when a    
+  sensor they depend on was offline since the last event; the detector skips    
+  them."                                                                        
+                                                                                
+  2. Medium: new numbers in design.md can't be reproduced from analysis.ipynb   
+  - Reason: The notebook has no cell that computes these figures quoted in      
+  design.md:                                                                    
+    - the temp_resid statistics (std 0.12, range −0.46 to +0.60, the train      
+  spike values)                                                                 
+    - the minutes_since_door_open statistics (intrusions at 95–180 min, 28 of   
+  49 minutes ≤ 5 min)                                                           
+    - the baseline contamination (50% → 25%)                                    
+    - the rolling mean vs median rate comparison                                
+    - the warm-up check ("84 NaN, 103–120 wrong cells")                         
+      ... but keep them small. For #2, add a short feature checks so we can     
+  match the number in design. #1, return nan for minutes_since_door_open when   
+  the door was ffline after its last opening.                                   
+
+● I'll make both changes, keeping them small.
+
+● Update(features.py)
+  ⎿  Added 8 lines, removed 2 lines
+      264  
+      265  
+      266  def door_features(df):
+      267 -    """Minutes the door has been open (0 when closed) and minu
+          -tes since it was last open."""                                
+      267 +    """Minutes the door has been open (0 when closed) and minu
+          +tes since it was last open.                                   
+      268 +                                                              
+      269 +    minutes_since_door_open is NaN (unknown) if the door senso
+          +r was offline after its                                       
+      270 +    last opening: an entry during the outage would otherwise l
+          +ook like no entry.                                            
+      271 +    """                                                       
+      272      door = df[cfg.DOOR]
+      273      open_minutes = run_length(door).where(door == 1, 0.0)
+      274 +    since_open = minutes_since(door == 1, cap=WARMUP_MINUTES) 
+      275 +    since_offline = minutes_since(door.isna(), cap=WARMUP_MINU
+          +TES)                                                          
+      276      return pd.DataFrame({
+      277          "door_open_minutes": open_minutes.where(door.notna()),
+      272 -        "minutes_since_door_open": minutes_since(door == 1, ca
+          -p=WARMUP_MINUTES),                                            
+      278 +        "minutes_since_door_open": since_open.where(since_offl
+          +ine >= since_open),                                           
+      279      }, index=df.index)
+      280  
+      281  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The fix resolves the issue: during a simulated door outage, the returning
+  person's motion now correctly shows minutes_since_door_open as NaN instead of
+  falsely reading 180 like an intrusion, while val/test data remains unchanged.
+  Next I'll move on to the feature-checks section of the notebook.
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+● Unknown command: /apply. Did you mean /app?
+
+❯ conitnue with the fix                                                         
+
+● I'll finish the fixes in smaller steps. First, the design rule for #1:
+
+● Update(docs\design.md)
+  ⎿  Added 1 line
+      245    - Normal train: std 0.12 °C, range −0.46 to +0.60 °C.
+      246    - Train spikes: −4.11, +3.62, +3.75 / +3.57 °C.
+      247  - **Cross-sensor door link (`minutes_since_door_open`):** intr
+           usion is defined as motion without door entry, so motion needs
+            a link to door activity.
+      248 +  - **Cross-sensor features are unknown (NaN) when a sensor th
+          +ey depend on was offline since the last event; the detector sk
+          +ips them.** For example, a return home during a door outage wo
+          +uld otherwise look like motion with no entry, i.e. an intrusio
+          +n.                                                            
+      249    - Capped at 180 min (= warm-up length), so the value never d
+           epends on how much history is loaded. The reviewer suggested N
+           aN until the first opening; the cap keeps warm-up and continuo
+           us runs identical.
+      250    - Train intrusion motion minutes: 95–180 min since the door 
+           was last open.
+      251    - Normal motion in Tue–Thu 09–17 h: 28 of 49 minutes are ≤ 5
+            min after a door opening (returns home). 5 minutes are > 30 m
+           in after one (3 stray triggers, 2 at 17:58–17:59 after an earl
+           ier return).
+
+● Now #2: I'll add one short code cell to the notebook that prints every quoted
+  number in a single table.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The rejected command seems to have partly run: the builder already contains
+  the check cells. I'll look at what's there before changing anything.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● The notebook was rebuilt but hasn't been executed yet, so it's currently 22 KB
+  with no outputs. I'll run it now as a separate step.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -m
+      nbconvert --to notebook --execute --inplace analysis.ipynb 2>&1 | grep -i
+      "error\|Writ…)
+  ⎿  [NbConvertApp] Writing 908754 bytes to analysis.ipynb
+  ⎿  1 file changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Everything matches design.md except the warm-up line—with the two new
+  features, cell counts now total 93 NaN and 115–128 wrong (up from 84 and
+  103–120). I'll update that line and link design.md to the relevant notebook
+  section.
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      256    - A rolling mean was slightly smoother (0.14 °C/h), but a sp
+           ike leaked into the rate for up to 30 min afterwards (normal-m
+           inute minimum −2.51 °C/h). The median ignores 1–3 min spikes (
+           minimum −1.24 °C/h).
+      257    - With the median, `temp_rate_60` during a heating failure r
+           eads close to the true fall rate (−0.62 to −0.66 vs 0.65–0.69 
+           °C/h).
+      258  - **Split-start warm-up:** val/test features are built with th
+           e last 180 min of the previous split prepended (`split_feature
+           s`), then trimmed.
+      259 -  - Verified: the first hour of val and test is identical to o
+          -ne continuous run over all 28 days. Without warm-up it had 84 
+          -NaN and 103–120 wrong feature cells.                          
+      259 +  - Verified: the first hour of val and test is identical to o
+          +ne continuous run over all 28 days (all 15 numeric features). 
+          +Without warm-up it has 93 NaN and 115–128 wrong feature cells.
+      260    - The warm-up rows are past data (a live stream has them) an
+           d are never used to fit anything.
+      261    - Train has no earlier split, so its first hour stays withou
+           t history.
+      262  - **Generator start-up fix:** the temperature simulation now s
+           tarts from a settled midnight value (a burn-in run of day 1's 
+           schedule) instead of the 18 °C setback. Mon 8 Jan 00–07 h now 
+           averages 19.33 °C vs 19.36 °C on other nights (was ~18 °C). It
+            uses no random numbers, so all other data and every label are
+            unchanged.
+
+● Update(docs\design.md)
+  ⎿  Added 2 lines
+      261    - Train has no earlier split, so its first hour stays withou
+           t history.
+      262  - **Generator start-up fix:** the temperature simulation now s
+           tarts from a settled midnight value (a burn-in run of day 1's 
+           schedule) instead of the 18 °C setback. Mon 8 Jan 00–07 h now 
+           averages 19.33 °C vs 19.36 °C on other nights (was ~18 °C). It
+            uses no random numbers, so all other data and every label are
+            unchanged.
+      263  
+      264 +All feature statistics quoted above (residual, door link, base
+          +line contamination, rate noise, warm-up) are reproduced in `an
+          +alysis.ipynb`, section 5 "Feature checks".                    
+      265 +                                                              
+      266  ### EDA findings (from `analysis.ipynb`, plots in `outputs/eda
+           /`)
+      267  - **Data quality:** per split there are 2 duplicate rows, 1 hu
+           b outage (26 / 40 / 33 missing rows) and 0 out-of-order timest
+           amps. Cleaning detects exactly 2 offline periods per sensor pe
+           r split, matching the generation log. Offline minutes = logged
+            minutes − 2 per outage (the forward fill).
+      268  
+
+● I've finished both fixes, and the notebook ran with no errors.
+
+  #1, door offline: minutes_since_door_open is now NaN (unknown) whenever the
+  door sensor was offline after its last opening.
+  - Simulated test: I blanked the door sensor in a copy of the data over a
+    Tuesday return home. The returning person's motion now gets NaN. Before the
+    fix it would have read 180, exactly like an intrusion.
+  - Warm-up still holds: the first hour of val and test still matches the
+    continuous 28-day run.
+  - Effect on the real data: 404 / 148 / 336 minutes in train / val / test are
+    now NaN (outage periods plus the time until the next opening).
+  - design.md now states the rule: cross-sensor features are NaN when a sensor
+    they depend on was offline since the last event, and the detector skips
+    them.
+
+  #2, reproducible numbers: the notebook has a new section 5, "Feature checks",
+  with five short cells:
+
+  ┌─────────────────┬───────────────────────────────────────────────────────┐
+  │      Check      │              Output (matches design.md)               │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ temp_resid      │ Normal std 0.12, range −0.46 to +0.60 °C. Spikes      │
+  │                 │ −4.11, +3.62, +3.75, +3.57 °C                         │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │                 │ Intrusions happen 95–180 min after the last opening.  │
+  │ Door link       │ Of 49 normal empty-hours motion minutes, 28 are ≤ 5   │
+  │                 │ min after an opening and 5 are > 30 min               │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Baseline        │ 50% → 25%                                             │
+  │ contamination   │                                                       │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Rate noise      │ Std 0.56 (raw) / 0.14 (mean) / 0.18 (median). Minimum │
+  │                 │  −15.72 / −2.51 / −1.24 °C/h                          │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │                 │ Identical with warm-up. Without it: 93 NaN and        │
+  │ Warm-up         │ 115–128 wrong cells. I updated design.md from the old │
+  │                 │  84 and 103–120, because the two new features add     │
+  │                 │ cells to compare.                                     │
+  └─────────────────┴───────────────────────────────────────────────────────┘
+
+  The rejected command had already rebuilt the notebook but stopped before
+  running it, so I ran it as a separate step.
+
+  Before Stage 5: please export this session into ai_transcripts/. These are
+  uncommitted: features.py, analysis.ipynb, outputs/eda/, design.md,
+  generate_data.py and data/. Want me to commit them? Once you've approved Stage
+  4, we'll start model comparison.
+
+✻ Crunched for 59s · done 3:46 PM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, and Stage 4 (Cleaning and EDA) is done, with both reviewer fixes applied and checked. Next, export this session, then tell me whether to commit and start Stage 5, model comparison.
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: C:\Users\Gracy\Projects\Anomaly
+     Detection\003_cleaning_and_eda.txt
+
+※ recap: We're building a smart-home anomaly detection proof of concept, and Stage 4 (Cleaning & EDA) is done with both reviewer fixes applied and checked. Next, please export this session to ai_transcripts/ and tell me whether to commit before we start model comparison.
+
+❯ lets move to the next stage                                                   
+
+● The transcript was saved to the project root (003_cleaning_and_eda.txt), not
+  to ai_transcripts/. You may want to move it there. Stage 4 changes are still
+  uncommitted; tell me if you want a commit.
+
+  Stage 5: model comparison
+
+  We'll go through it in this order:
+  1. Structure: how the detectors are organised
+  2. Rule-based baseline
+  3. Isolation Forest
+  4. Turning per-minute scores into alerts
+  5. Tuning on val, and how we compare models
+
+  Whether to add a third model is decided after we see results, as your plan
+  says.
+
+  Topic 1: structure
+
+  Proposal: one detector per sensor, for every model, not a single detector over
+  all four sensors.
+
+  ┌─────────────────┬──────────────────────────────────┬───────────────────┐
+  │                 │     One detector per sensor      │ One detector for  │
+  │                 │                                  │    all sensors    │
+  ├─────────────────┼──────────────────────────────────┼───────────────────┤
+  │ "Detected on    │                                  │ Needs an extra    │
+  │ the correct     │ Built in: each alert belongs to  │ step to work out  │
+  │ sensor?"        │ one sensor                       │ which sensor      │
+  │                 │                                  │ caused it         │
+  ├─────────────────┼──────────────────────────────────┼───────────────────┤
+  │                 │                                  │ The whole minute  │
+  │ An offline      │ Skip only that sensor            │ is lost, or the   │
+  │ sensor          │                                  │ gap must be       │
+  │                 │                                  │ filled            │
+  ├─────────────────┼──────────────────────────────────┼───────────────────┤
+  │ Explaining an   │                                  │ "Combined score   │
+  │ alert           │ "Fridge: running for 85 min"     │ 0.71", hard to    │
+  │                 │                                  │ explain           │
+  ├─────────────────┼──────────────────────────────────┼───────────────────┤
+  │ Cross-sensor    │ Context comes in as features     │ Learned           │
+  │ anomalies       │ (e.g. minutes_since_door_open in │ implicitly        │
+  │                 │  the motion detector)            │                   │
+  └─────────────────┴──────────────────────────────────┴───────────────────┘
+
+  Each detector sees only its own sensor's features plus the context features:
+
+  ┌─────────────┬────────────────────────────────────────────────────────────┐
+  │  Detector   │                           Inputs                           │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ Temperature │ temp_dev, temp_resid, temp_rate_15, temp_rate_60, hour,    │
+  │             │ day type                                                   │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ Fridge      │ power_fridge, fridge_mode, fridge_mode_minutes             │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ Motion      │ motion_15, motion_60, minutes_since_door_open, hour, day   │
+  │             │ type                                                       │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ Door        │ door_open_minutes, hour, day type                          │
+  └─────────────┴────────────────────────────────────────────────────────────┘
+
+  The fridge gets no time context, because EDA showed it has no daily pattern.
+
+  Question: Do you agree with one detector per sensor and these inputs?
+
+✻ Sautéed for 13s · done 3:57 PM
+
+❯ yes, go ahead                                                                 
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 17 lines
+      276  
+      277  ---
+      278  
+      279 +## Stage 5 – Model Comparison                                 
+      280 +                                                              
+      281 +### Structure: one detector per sensor (all models)           
+      282 +- Alerts are attributed to a sensor by construction ("correct 
+          +sensor" metric).                                              
+      283 +- An offline sensor only disables its own detector.           
+      284 +- Alerts are explainable per sensor.                          
+      285 +- Cross-sensor context enters as features (e.g. `minutes_since
+          +_door_open`).                                                 
+      286 +                                                              
+      287 +| Detector | Inputs |                                         
+      288 +|---|---|                                                     
+      289 +| Temperature | `temp_dev`, `temp_resid`, `temp_rate_15`, `tem
+          +p_rate_60`, hour, day type |                                  
+      290 +| Fridge | `power_fridge`, `fridge_mode`, `fridge_mode_minutes
+          +` (no time context: no daily pattern in EDA) |                
+      291 +| Motion | `motion_15`, `motion_60`, `minutes_since_door_open`
+          +, hour, day type |                                            
+      292 +| Door | `door_open_minutes`, hour, day type |                
+      293 +                                                              
+      294 +---                                                           
+      295 +                                                              
+      296  ## README Carry-Over
+      297  Items to include in README.md when it is written at the end:
+      298  
+
+● I've recorded Topic 1 in design.md.
+
+  Topic 2: rule-based baseline
+
+  Each rule outputs a flag and a readable reason. Thresholds come from physics
+  or simple house rules, never from labels. Only the thresholds marked tuned are
+  adjusted on val.
+
+  Sensor: Temperature
+  Rule: Spike
+  Condition: |temp_resid| > 1.5 °C
+  Threshold source: Physics: a room can't jump 1.5 °C within a few minutes
+  ────────────────────────────────────────
+  Sensor: Temperature
+  Rule: Heating failure
+  Condition: temp_dev < −d and temp_rate_60 < −r, sustained for 15 min
+  Threshold source: Tuned: d and r. Normal night cooling keeps temp_dev near 0
+  because the baseline cools with it, so the deviation is what separates a
+  failure.
+  ────────────────────────────────────────
+  Sensor: Fridge
+  Rule: Power loss
+  Condition: Power < 1 W for 10 min
+  Threshold source: Physics: a working fridge idles at 2–5 W
+  ────────────────────────────────────────
+  Sensor: Fridge
+  Rule: Stuck on
+  Condition: Running for > 45 min
+  Threshold source: Physics: compressor runs last 10–20 min
+  ────────────────────────────────────────
+  Sensor: Motion
+  Rule: Intrusion
+  Condition: During away hours: ≥ 2 motion minutes in the last 15 min, and no
+  door opening in the last D min
+  Threshold source: Tuned: D. Requiring 2 minutes ignores single stray triggers.
+  ────────────────────────────────────────
+  Sensor: Door
+  Rule: Left open
+  Condition: Open for > 10 min
+  Threshold source: House rule
+  ────────────────────────────────────────
+  Sensor: Door
+  Rule: Night opening
+  Condition: Door opens during night hours
+  Threshold source: Schedule
+
+  A design choice to make: the away and night hours.
+  - Option A (recommended): a schedule the user configures in config.py: away
+    Tue–Thu 09:00–17:00, night 00:00–05:00. That's realistic, since smart-home
+    apps have "away" and "night" modes. It also makes the two models a clear
+    contrast: the rules use what the user tells them, and Isolation Forest
+    learns context from the data.
+  - Option B: learn the quiet hours from unlabelled train motion. The catch is
+    that motion alone can't tell an empty house from a sleeping one. Night
+    bathroom trips would then trigger "intrusion" alerts unless we add more
+    logic.
+
+  Questions:
+  1. Option A (a configured schedule)?
+  2. Are the fixed thresholds reasonable (1.5 °C, 1 W, 45 min, 10 min), with
+     only d, r and D tuned on val?
+
+✻ Baked for 31s · done 4:01 PM
+
+※ recap: We're building the smart-home anomaly detection proof of concept, now in Stage 5 (model comparison) with the rule-based baseline proposed. Next: you choose the configured schedule (Option A) or learned quiet hours, and approve the fixed thresholds.
+
+❯ Option A, note that the models dont get the configured schedule...Change      
+  stuck on from 45 to 30 minute. Justify 1W with unlabbeled                     
+
+● I'll check both thresholds against the unlabelled train data: power readings
+  for the 1 W threshold, and running-period lengths for the 30-min threshold.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I confirmed both thresholds (1 W power cutoff, 30 min stuck-on limit) fall in
+  clear empty gaps of the unlabelled train data, so they're justified without
+  needing labels. I'll now record both decisions along with the schedule note.
+
+● Update(docs\design.md)
+  ⎿  Added 17 lines
+      291  | Motion | `motion_15`, `motion_60`, `minutes_since_door_open`
+           , hour, day type |
+      292  | Door | `door_open_minutes`, hour, day type |
+      293  
+      294 +### Rule-based baseline                                       
+      295 +Each rule outputs a flag plus a readable reason. Thresholds co
+          +me from physics, house rules, or valleys in **unlabelled** tra
+          +in distributions, never from labels. Only d, r and D are tuned
+          + on val.                                                      
+      296 +                                                              
+      297 +| Sensor | Rule | Condition | Threshold source |              
+      298 +|---|---|---|---|                                             
+      299 +| Temperature | Spike | \|`temp_resid`\| > 1.5 °C | Physics (a
+          + room can't jump 1.5 °C in minutes); normal resid ≤ 0.6 °C |  
+      300 +| Temperature | Heating failure | `temp_dev` < −d and `temp_ra
+          +te_60` < −r, sustained 15 min | **Tuned on val** |            
+      301 +| Fridge | Power loss | Power < 1 W for 10 min | Valley in unl
+          +abelled train power: 0 minutes in 0.75–1.0 W, between the ~0 W
+          + cluster (269 min) and idle (≥ 1.0 W) |                       
+      302 +| Fridge | Stuck on | Running > **30 min** | Gap in unlabelled
+          + train running periods: q99 = 22 min, none between 22 and 60 m
+          +in |                                                          
+      303 +| Motion | Intrusion | During configured away hours: `motion_1
+          +5` ≥ 2 and no door opening in the last D min | **Tuned on val*
+          +* (D). ≥ 2 ignores single stray triggers |                    
+      304 +| Door | Left open | Open > 10 min | House rule |             
+      305 +| Door | Night opening | Door opens during configured night ho
+          +urs | Schedule |                                              
+      306 +                                                              
+      307 +- **Configured schedule (Option A):** away = Tue–Thu 09:00–17:
+          +00, night = 00:00–05:00, in `config.py`. It mimics a user's "a
+          +way / night mode" settings.                                   
+      308 +- **Only the rule baseline gets the schedule.** The ML models 
+          +(Isolation Forest, and any later model) do **not**; they must 
+          +learn context from hour and day type in the data. This is a de
+          +liberate contrast between the two approaches.                 
+      309 +- Option B (learning quiet hours from motion) was rejected: mo
+          +tion alone cannot tell an empty house from a sleeping one, so 
+          +night bathroom trips would trigger intrusion alerts.          
+      310 +                                                              
+      311  ---
+      312  
+      313  ## README Carry-Over
+● I've recorded Topic 2 in design.md, including the fact that only the rules get
+  the schedule.
+
+  Topic 3: Isolation Forest
+
+  Aspect: Models
+  Proposal: 4 separate Isolation Forests, one per sensor, using Topic 1's inputs
+  Why: Same structure as the rules
+  ────────────────────────────────────────
+  Aspect: Training data
+  Proposal: Unlabelled train, including the anomalies that are mixed in
+  Why: Realistic: a real system never has labels
+  ────────────────────────────────────────
+  Aspect: Time inputs
+  Proposal: Hour as sin/cos so 23:00 sits next to 00:00; day type and fridge
+  mode
+  as 0/1 columns
+  Why: Trees can then learn combinations like "motion at this hour on this day
+  type"
+  ────────────────────────────────────────
+  Aspect: Settings
+  Proposal: 200 trees, default sample size, seed from config.py, nothing tuned
+  Why: Keeps it simple; only the alert threshold matters
+  ────────────────────────────────────────
+  Aspect: contamination setting
+  Proposal: Not used. The threshold on the anomaly score is tuned on val per
+  sensor (Topic 5), starting from a high percentile of the train scores
+  Why: Isolation Forest's built-in cut-off is a guess; val gives a measured one
+  ────────────────────────────────────────
+  Aspect: Missing inputs
+  Proposal: If any input is NaN (sensor offline, or minutes_since_door_open
+  unknown), that sensor's detector skips the minute
+  Why: Same rule as the baseline. Isolation Forest can't take NaN.
+  ────────────────────────────────────────
+  Aspect: Explaining alerts
+  Proposal: Isolation Forest gives only a score. I'd attach a reason: the input
+  feature whose value is most extreme compared with train, e.g.
+  "fridge_mode_minutes = 85, above 99.9% of train"
+  Why: Answers "can an engineer understand why an alert was generated?"
+
+  A risk to know about (medium priority): Isolation Forest scores each minute on
+  its own. Long anomalies are only found if the features themselves capture
+  duration, which they do for fridge (fridge_mode_minutes), door
+  (door_open_minutes) and temperature rate (temp_rate_60). Patterns that need a
+  longer memory than our features hold won't be caught.
+
+  I'll install scikit-learn when we start writing the code.
+
+  Questions:
+  1. Is this setup OK, especially tuning the threshold on val rather than
+     setting contamination?
+  2. Is the "most extreme feature" explanation enough? The alternative is SHAP
+     values, which are more precise but add a dependency and complexity.
+
+✻ Churned for 41s · done 4:25 PM
+
+※ recap: We're building a smart-home anomaly-detection proof of concept and are on Stage 5, model comparison, having just proposed the Isolation Forest setup. Next, you decide whether to tune its threshold on val and whether the "most extreme feature" explanation is enough.
+
+❯ 1. Yes. Tune the threshold on val; do nt let it contaminate. 2. Most extreme  
+  feature should be enough for now. Include Shap extension in readme. Also show 
+  the 30 min/1w evidence in brief.                                              
+
+● Update(docs\design.md)
+  ⎿  Added 15 lines
+      307  - **Configured schedule (Option A):** away = Tue–Thu 09:00–17:
+           00, night = 00:00–05:00, in `config.py`. It mimics a user's "a
+           way / night mode" settings.
+      308  - **Only the rule baseline gets the schedule.** The ML models 
+           (Isolation Forest, and any later model) do **not**; they must 
+           learn context from hour and day type in the data. This is a de
+           liberate contrast between the two approaches.
+      309  - Option B (learning quiet hours from motion) was rejected: mo
+           tion alone cannot tell an empty house from a sleeping one, so 
+           night bathroom trips would trigger intrusion alerts.
+      310 +- The 1 W and 30 min evidence is reproduced in `analysis.ipynb
+          +` section 5 (check 5.6).                                      
+      311  
+      312 +### Isolation Forest                                          
+      313 +                                                              
+      314 +| Aspect | Decision |                                         
+      315 +|---|---|                                                     
+      316 +| Models | 4 per-sensor Isolation Forests with the Topic 1 inp
+          +uts |                                                         
+      317 +| Training data | Unlabelled train (contains unlabelled anomal
+          +ies) |                                                        
+      318 +| Encoding | Hour as sin/cos; day type and fridge mode one-hot
+          + |                                                            
+      319 +| Settings | 200 trees, default `max_samples`, `random_state` 
+          += config seed; no hyperparameter tuning |                     
+      320 +| Threshold | `contamination` is **not** used to set the cut-o
+          +ff. The per-sensor threshold on `score_samples` is **tuned on 
+          +val**, starting from a high percentile of train scores |      
+      321 +| Missing inputs | Any NaN input (offline sensor, unknown `min
+          +utes_since_door_open`) → that detector skips the minute |     
+      322 +| Explanation | Each alert reports its most extreme input feat
+          +ure compared with the train distribution (e.g. "fridge_mode_mi
+          +nutes = 85, above 99.9% of train"). SHAP is a README extension
+          + |                                                            
+      323 +                                                              
+      324 +- **Known limitation:** IF scores each minute independently. D
+          +uration is only captured where a feature encodes it (`fridge_m
+          +ode_minutes`, `door_open_minutes`, `temp_rate_60`).           
+      325 +                                                              
+      326  ---
+      327  
+      328  ## README Carry-Over
+
+● Update(docs\design.md)
+  ⎿  Added 6 lines
+      353    - Fridge modes come from fixed thresholds.
+      354    - The temperature rate uses a rolling median.
+      355    - Val/test get a 180-min warm-up from the previous split.
+      356 +- **Rule thresholds from unlabelled data:**                   
+      357 +  - Fridge power loss at < 1 W sits in an empty valley (0 trai
+          +n minutes in 0.75–1.0 W, between the ~0 W cluster and idle at 
+          +≥ 1.0 W).                                                     
+      358 +  - Stuck-on at > 30 min sits in a gap (q99 of running periods
+          + = 22 min, none between 22 and 60 min).                       
+      359 +  - Show briefly as evidence that no labels were used.        
+      360 +- **Explainability extension:** IF alerts currently report the
+          + most extreme feature vs train. Future work: SHAP values (e.g.
+          + `shap.TreeExplainer` on each IF) for per-feature contribution
+          +s.                                                            
+      361 +- **Schedule vs learned context:** the rule baseline uses a us
+          +er-configured away/night schedule; the ML models get no schedu
+          +le and learn context from the data.                           
+      362  - **Heating failure is contextual:** normal setback cooling (~
+           0.6 °C/h at its start) overlaps the slowest failures. The rate
+            of fall alone is not enough; the detector needs the context (
+           target 21 °C, awake and home).
+      363  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      364  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+
+  Made 1 scratchpad edit +19 -5 (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" &&
+      SP="C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anoma
+      ly-Detection/1000db6d-2780-4658-9c27…)
+  ⎿  wrote analysis.ipynb
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -m
+      nbconvert --to notebook --execute --inplace analysis.ipynb 2>&1 | grep -i
+      "error\|Writ…)
+  ⎿  [NbConvertApp] Writing 910541 bytes to analysis.ipynb
+  ⎿  1 file changed (binary, mode only or too large to show)
+  ⎿  (timeout 10m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I've recorded the Isolation Forest decisions in design.md: contamination is
+  not used, and the threshold is tuned on val. SHAP is in the README Carry-Over
+  as an extension, along with brief evidence for the two thresholds. That
+  evidence is also now reproducible in the notebook (check 5.6), from unlabelled
+  train data:
+  - Power: 0 minutes fall between 0.75 and 1.0 W. That's the gap between the ~0
+    W cluster (269 min) and idle readings (≥ 1.0 W).
+  - Running periods: 99% last ≤ 22 min, none lasts 22–60 min, and 3 last over 60
+    min.
+
+  Topic 4: turning per-minute flags into alerts
+
+  Both models produce a flag per minute per sensor. A user should get one alert 
+  per incident, not a flag every minute.
+
+  Step: Alert starts
+  Proposal: At the first flagged minute, which is when it's sent in real time
+  Why: Causal; detection delay is measured from here
+  ────────────────────────────────────────
+  Step: Merge
+  Proposal: Flagged minutes on the same sensor less than 10 min apart belong to
+  one alert
+  Why: Intrusion motion and noisy scores flicker on and off; without merging,
+  one
+  incident becomes several alerts
+  ────────────────────────────────────────
+  Step: Alert record
+  Proposal: sensor, model, start, end, reason
+  Why: reason is the rule name, or the Isolation Forest's most extreme feature
+  at
+  the first minute
+  ────────────────────────────────────────
+  Step: Minimum length
+  Proposal: None for either model
+  Why: Spikes last 1–3 min, so requiring several minutes in a row would miss
+  them. Rules that need persistence have it built in (heating 15 min, power
+  loss 10 min).
+
+  - Merging only extends an alert that's already been sent, so it never delays
+    it.
+  - The alerts file (outputs/alerts_<model>_<split>.csv) is the "detected
+    anomalies" output the task asks for.
+
+  Questions:
+  1. Is a 10-minute merge gap OK? Too short splits intermittent intrusions into
+     several alerts; too long merges separate incidents.
+  2. No minimum length for Isolation Forest? If val shows many 1-minute false
+     alarms, we could revisit this, but only for the Isolation Forest.
+
+✻ Churned for 45s · done 4:34 PM
+
+※ recap: We're building a smart-home anomaly detection proof of concept, now in Stage 5 (model comparison), designing how per-minute flags become alerts. Next: answer whether a 10-minute merge gap is OK and whether Isolation Forest should have no minimum alert length.
+
+❯ 1. 10 min is fine 2. Lets leave it as no minimum for now. Lets move fast to   
+  the mnext topic                                                               
+
+● Update(docs\design.md)
+  ⎿  Added 6 lines
+      321  | Missing inputs | Any NaN input (offline sensor, unknown `min
+           utes_since_door_open`) → that detector skips the minute |
+      322  | Explanation | Each alert reports its most extreme input feat
+           ure compared with the train distribution (e.g. "fridge_mode_mi
+           nutes = 85, above 99.9% of train"). SHAP is a README extension
+            |
+      323  
+      324 +### Minute flags → alerts (both models)                       
+      325 +- An alert starts at the first flagged minute, which is when i
+          +t is sent in real time.                                       
+      326 +- Flagged minutes on the same sensor < 10 min apart are merged
+          + into one alert. Merging only extends an alert already sent.  
+      327 +- Alert record: `sensor, model, start, end, reason`, written t
+          +o `outputs/alerts_<model>_<split>.csv` (the task's "detected a
+          +nomalies" output).                                            
+      328 +- No minimum alert length; persistence lives inside the rules 
+          +that need it. To be revisited for IF only if val shows many 1-
+          +minute false alarms.                                          
+      329 +                                                              
+      330  - **Known limitation:** IF scores each minute independently. D
+           uration is only captured where a feature encodes it (`fridge_m
+           ode_minutes`, `door_open_minutes`, `temp_rate_60`).
+      331  
+      332  ---
+
+● I've recorded Topic 4 in design.md.
+
+  Topic 5: tuning on val, and comparing the models
+
+  How an alert is scored:
+  - Hit: an alert on the anomaly's sensor that overlaps the anomaly's labelled
+    time span.
+  - False alarm: an alert that overlaps no anomaly on its sensor. Alerts during
+    benign events count as false alarms.
+
+  Tuning objective, per sensor: minimise missed anomalies + false alarms. You
+  weighted the two equally in Stage 1. On a tie, take the setting with fewer
+  false alarms.
+
+  ┌────────────┬────────────────────────┬──────────────────────────────────┐
+  │   Model    │ What gets tuned on val │           Search grid            │
+  ├────────────┼────────────────────────┼──────────────────────────────────┤
+  │            │ d (deviation), r (fall │ Small grid, e.g. d ∈ {0.5, 0.75, │
+  │ Rules      │  rate), D (minutes     │  1.0} °C, r ∈ {0.2, 0.3, 0.4}    │
+  │            │ since door)            │ °C/h, D ∈ {15, 30, 60} min       │
+  ├────────────┼────────────────────────┼──────────────────────────────────┤
+  │ Isolation  │ One score threshold    │ Percentiles of the train scores: │
+  │ Forest     │ per sensor             │  99.0, 99.5, 99.9, 99.95, 99.99  │
+  └────────────┴────────────────────────┴──────────────────────────────────┘
+
+  Risk (medium priority): val has only 2–4 anomalies per sensor, so tuning can
+  overfit. To limit that: keep the grids small, prefer the more conservative
+  setting on ties, and report the tuned values. Test then gives the honest
+  number.
+
+  Comparison table:
+
+  ┌────────────────┬─────────────────────────────────────────────────────┐
+  │   Criterion    │                       Measure                       │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ Detection      │ Anomalies detected / total, per sensor and per type │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ False alarms   │ Count and per day                                   │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ Speed          │ Median minutes from anomaly start to alert          │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ Size           │ Saved model file size                               │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ Complexity     │ Number of tuned parameters, and lines of code       │
+  ├────────────────┼─────────────────────────────────────────────────────┤
+  │ Explainability │ Is the reason readable?                             │
+  └────────────────┴─────────────────────────────────────────────────────┘
+
+  Question: OK to tune on "misses + false alarms" with these grids?
+
+✻ Baked for 17s · done 4:57 PM
+
+❯ Okay with the objective and grids. Additions: report false alarms on benign   
+  events separately (from the generation log), add inferecen time  per minute   
+  next to model size, select one model overall by total errors on val,          
+  preporting per sensor results. Also some scoring rules to add: 1. an alert on 
+  a difernt sensor during an anomaly is to be reported sepeerte and as a        
+  flaase aalarm. 2.  a fixed grace period after an anomaly ends still count as  
+  a hit 3. tie-break is lower delay; then the more conservative setting.        
+
+● Update(docs\design.md)
+  ⎿  Added 18 lines
+      327  - Alert record: `sensor, model, start, end, reason`, written t
+           o `outputs/alerts_<model>_<split>.csv` (the task's "detected a
+           nomalies" output).
+      328  - No minimum alert length; persistence lives inside the rules 
+           that need it. To be revisited for IF only if val shows many 1-
+           minute false alarms.
+      329  
+      330 +### Scoring, tuning and selection (val)                       
+      331 +**Scoring rules**                                             
+      332 +- **Hit:** an alert on the anomaly's sensor overlapping [anoma
+          +ly start, anomaly end + **15 min grace**].                    
+      333 +- **False alarm:** an alert on its sensor overlapping no anoma
+          +ly (+ grace) on that sensor.                                  
+      334 +- **Cross-sensor alarm:** an alert on a *different* sensor dur
+          +ing an anomaly counts as a false alarm and is also reported se
+          +parately.                                                     
+      335 +- **Benign-event alarms:** false alarms overlapping a benign e
+          +vent (from `generation_log.csv`) are reported separately, but 
+          +still count as false alarms.                                  
+      336 +                                                              
+      337 +**Tuning (per sensor)**                                       
+      338 +- Objective: minimise **misses + false alarms** (equal cost, S
+          +tage 1).                                                      
+      339 +- Tie-break 1: lower median detection delay. Tie-break 2: the 
+          +more conservative setting.                                    
+      340 +- Grids: rules d ∈ {0.5, 0.75, 1.0} °C, r ∈ {0.2, 0.3, 0.4} °C
+          +/h, D ∈ {15, 30, 60} min. IF threshold at train-score percenti
+          +les {99.0, 99.5, 99.9, 99.95, 99.99}.                         
+      341 +- Risk: only 2–4 val anomalies per sensor, so tuning can overf
+          +it. Small grids and conservative ties limit this; test gives t
+          +he honest number.                                             
+      342 +                                                              
+      343 +**Selection**                                                 
+      344 +- **One model overall**, chosen by total errors (misses + fals
+          +e alarms) on val across all sensors. Per-sensor results are re
+          +ported alongside.                                             
+      345 +                                                              
+      346 +**Comparison table:** detection per sensor/type, false alarms 
+          +(total, per day, cross-sensor, on benign events), median delay
+          +, model size, **inference time per minute**, number of tuned p
+          +arameters, explainability.                                    
+      347 +                                                              
+      348  - **Known limitation:** IF scores each minute independently. D
+           uration is only captured where a feature encodes it (`fridge_m
+           ode_minutes`, `door_open_minutes`, `temp_rate_60`).
+      349  
+      350  ---
+
+● I've recorded all of your additions in design.md:
+  - Cross-sensor alarms: counted as false alarms and also reported separately.
+  - Benign-event alarms: reported separately, using the generation log.
+  - Tie-breaks: lower delay first, then the more conservative setting.
+  - Selection: one model overall, by total errors on val, with per-sensor
+    results alongside.
+  - Comparison table: inference time per minute added next to model size.
+
+  One value I set: the grace period is 15 minutes.
+  - It covers a rule's persistence window finishing just after a short anomaly
+    ends, and a flag landing right as a door closes.
+  - Longer would start counting unrelated alerts as hits. Nearby anomalies are
+    at least 2 h apart, so 15 min can't run into the next one.
+  - Tell me if you'd prefer another value.
+
+  That completes the Stage 5 design. Should I go ahead and implement it?
+  - config.py: the away/night schedule and the grids.
+  - detect_anomalies.py: the rules, Isolation Forest, alerts, scoring, val
+    tuning, the comparison table, and saving the selected model to artifacts/.
+  - Install: scikit-learn.
+
+  I'll run it and report the val results only. Test stays untouched until the
+  production test stage.
+
+✻ Brewed for 19s · done 5:12 PM
+
+❯ go ahead with the two moels and give me the stats after the run               
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● scikit-learn 1.9.1 is installed. First, the new settings in config.py:
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && cat >> config.py
+      <<'EOF'…)
+  ⎿  {'heating_dev_degc': [0.5, 0.75, 1.0], 'heating_rate_degc_h': [0.2, 0.
+     3, 0.4], 'intrusion_no_door_minutes': [15, 30, 60]}
+  ⎿  Updated config.py (+37 -0)
+      150      "duplicate_rows_per_split": 2,
+      151      "dropped_reading_rate": 0.001,           # per sensor, sin
+           gle NaN cells
+      152  }
+      153 +                                                              
+      154 +# ============================================================
+      155 +# Detection (Stage 5) - see docs/design.md                    
+      156 +# ============================================================
+      157 +ARTIFACTS_DIR = ROOT / "artifacts"                            
+      158 +OUTPUTS_DIR = ROOT / "outputs"                                
+      159 +                                                              
+      160 +# User-configured schedule: used ONLY by the rule baseline, ne
+          +ver by ML models                                              
+      161 +SCHEDULE = {                                                  
+      162 +    "away": {"days": [1, 2, 3], "window": (9 * 60, 17 * 60)}, 
+          +  # Tue-Thu 09:00-17:00                                       
+      163 +    "night": {"window": (0, 5 * 60)},                         
+          +  # 00:00-05:00 every day                                     
+      164 +}                                                             
+      165 +                                                              
+      166 +# Fixed rule thresholds (physics / house rules / unlabelled-tr
+          +ain valleys)                                                  
+      167 +RULES = {                                                     
+      168 +    "spike_resid_degc": 1.5,                                  
+      169 +    "heating_sustain_minutes": 15,                            
+      170 +    "power_loss_watts": 1.0,                                  
+      171 +    "power_loss_minutes": 10,                                 
+      172 +    "stuck_on_minutes": 30,                                   
+      173 +    "intrusion_min_motion_15": 2,                             
+      174 +    "door_left_open_minutes": 10,                             
+      175 +}                                                             
+      176 +                                                              
+      177 +# Tuned on val (listed from least to most conservative)       
+      178 +RULE_GRID = {                                                 
+      179 +    "heating_dev_degc": [0.5, 0.75, 1.0],                     
+      180 +    "heating_rate_degc_h": [0.2, 0.3, 0.4],                   
+      181 +    "intrusion_no_door_minutes": [15, 30, 60],                
+      182 +}                                                             
+      183 +                                                              
+      184 +IFOREST = {"n_estimators": 200}                               
+      185 +IF_PERCENTILE_GRID = [99.0, 99.5, 99.9, 99.95, 99.99]   # of t
+          +rain scores                                                   
+      186 +                                                              
+      187 +# Alerts and scoring                                          
+      188 +ALERT_MERGE_GAP_MINUTES = 10                                  
+      189 +GRACE_MINUTES = 15                                            
+
+● Moving on to detect_anomalies.py, which I'll keep built from plain functions
+  operating on sklearn models and dicts, avoiding custom classes so the saved
+  artifact stays easy to unpickle later in inference.py.
+
+● Write(detect_anomalies.py)
+  ⎿  Wrote 431 lines to detect_anomalies.py
+       1 """Compare two per-sensor detectors on val, select one, and save
+       2 
+       3 Models (docs/design.md, Stage 5):
+       4     rules    - physics / house-rule thresholds + user-configured
+       5     iforest  - one Isolation Forest per sensor on causal feature
+         s (no schedule)
+       7 Pipeline:
+       8     1. Features: train (fit) and val (tune/select); test is neve
+         r loaded here
+      10     3. Flags -> alerts (merge gap)
+     … +533 lines (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && time
+      .venv/Scripts/python detect_anomalies.py 2>&1 | tail -60)
+  ⎿  Tuned rules: {'temp_living_room': {'heating_dev_degc': 0.5, 'heating_r
+     ate_degc_h': 0.2}, 'power_fridge': {}, 'motion_hallway': {'intrusion_n
+     o_door_minutes': 60}, 'door_front': {}}
+     … +34 lines (ctrl+o to expand)
+  ⎿  Created artifacts\selected_model.json (+14 -0)
+       1 +{                                                              
+       2 +  "model": "rules",                                            
+       3 +  "tuned_settings": {                                          
+       4 +    "temp_living_room": {                                      
+       5 +      "heating_dev_degc": 0.5,                                 
+       6 +      "heating_rate_degc_h": 0.2                               
+       7 +    },                                                         
+       8 +    "power_fridge": {},                                        
+       9 +    "motion_hallway": {                                        
+      10 +      "intrusion_no_door_minutes": 60                          
+      11 +    },                                                         
+      12 +    "door_front": {}                                           
+      13 +  }                                                            
+      14 +}                                                              
+  ⎿  Created outputs\alerts_iforest_val.csv (+13 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +temp_living_room,iforest,2024-01-22 06:56:00,2024-01-22 06:56:0
+         +0,"temp_dev = 0.97, above 99.6% of train"                      
+       3 +power_fridge,iforest,2024-01-22 19:40:00,2024-01-22 19:52:00,"f
+         +ridge_mode_minutes = 103.00, above 99.7% of train"             
+       4 +power_fridge,iforest,2024-01-23 07:45:00,2024-01-23 08:03:00,"f
+         +ridge_mode_minutes = 105.00, above 99.7% of train"             
+       5 +temp_living_room,iforest,2024-01-26 11:55:00,2024-01-26 11:55:0
+         +0,"temp_rate_15 = -1.08, below 99.9% of train"                 
+       6 +temp_living_room,iforest,2024-01-26 12:06:00,2024-01-26 12:06:0
+         +0,"temp_rate_60 = -0.86, below 100.0% of train"                
+       7 +temp_living_room,iforest,2024-01-26 12:26:00,2024-01-26 12:36:0
+         +0,"temp_dev = -2.05, below 99.9% of train"                     
+       8 +temp_living_room,iforest,2024-01-26 13:13:00,2024-01-26 13:23:0
+         +0,"temp_rate_15 = 2.32, above 99.1% of train"                  
+       9 +temp_living_room,iforest,2024-01-26 13:38:00,2024-01-26 13:38:0
+         +0,"temp_resid = 0.34, above 99.1% of train"                    
+      10 +motion_hallway,iforest,2024-01-27 22:20:00,2024-01-27 22:21:00,
+         +"motion_15 = 11.00, above 99.8% of train"                      
+      11 +motion_hallway,iforest,2024-01-27 22:53:00,2024-01-27 22:55:00,
+         +"motion_15 = 11.00, above 99.8% of train"                      
+      12 +temp_living_room,iforest,2024-01-28 10:41:00,2024-01-28 11:06:0
+         +0,"temp_dev = -2.07, below 99.9% of train"                     
+      13 +temp_living_room,iforest,2024-01-28 11:17:00,2024-01-28 11:21:0
+         +0,"temp_resid = 0.35, above 99.1% of train"                    
+  ⎿  Created outputs\alerts_rules_val.csv (+15 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +door_front,rules,2024-01-22 04:39:00,2024-01-22 04:40:00,door o
+         +pen in night hours (night opening)                             
+       3 +power_fridge,rules,2024-01-22 18:17:00,2024-01-22 19:52:00,frid
+         +ge < 1.0 W for 10 min (power loss)                             
+       4 +power_fridge,rules,2024-01-23 01:14:00,2024-01-23 01:44:00,comp
+         +ressor running > 30 min (stuck on)                             
+       5 +power_fridge,rules,2024-01-23 06:16:00,2024-01-23 08:03:00,frid
+         +ge < 1.0 W for 10 min (power loss)                             
+       6 +motion_hallway,rules,2024-01-24 15:15:00,2024-01-24 15:16:00,"m
+         +otion in away hours, no door opening for 60 min (intrusion)"   
+       7 +door_front,rules,2024-01-24 21:00:00,2024-01-24 21:36:00,door o
+         +pen > 10 min (left open)                                       
+       8 +door_front,rules,2024-01-25 03:00:00,2024-01-25 03:02:00,door o
+         +pen in night hours (night opening)                             
+       9 +temp_living_room,rules,2024-01-25 05:46:00,2024-01-25 05:46:00,
+         +temp jumped > 1.5 degC from recent readings (spike)            
+      10 +motion_hallway,rules,2024-01-25 16:54:00,2024-01-25 16:59:00,"m
+         +otion in away hours, no door opening for 60 min (intrusion)"   
+      11 +temp_living_room,rules,2024-01-26 05:48:00,2024-01-26 05:48:00,
+         +temp jumped > 1.5 degC from recent readings (spike)            
+      12 +temp_living_room,rules,2024-01-26 11:20:00,2024-01-26 13:02:00,
+         +temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (
+         +heating failure)                                               
+      13 +power_fridge,rules,2024-01-27 05:20:00,2024-01-27 06:03:00,comp
+         +ressor running > 30 min (stuck on)                             
+      14 +temp_living_room,rules,2024-01-28 08:52:00,2024-01-28 10:50:00,
+         +temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (
+         +heating failure)                                               
+      15 +door_front,rules,2024-01-28 20:06:00,2024-01-28 20:54:00,door o
+         +pen > 10 min (left open)                                       
+  ⎿  Created outputs\val_comparison.csv (+3 -0)
+      1 +model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,be
+        +nign_fa,total_errors,median_delay_min (median over sensors),mode
+        +l_size_kb,ms_per_minute,tuned_params,explainability             
+      2 +rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0006,3,rule name + thresho
+        +ld (e.g. 'compressor running > 30 min')                         
+      3 +iforest,4/14,10,3,0.43,0,2,13,113.0,11476.7,0.0194,4,"most extre
+        +me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        +')"                                                             
+  ⎿  Created outputs\val_per_sensor.csv (+9 -0)
+      1 +model,sensor,anomalies,hits,misses,false_alarms,cross_sensor_fa,
+        +benign_fa,errors,median_delay_min                               
+      2 +rules,temp_living_room,4,4,0,0,0,0,0,27.5                       
+      3 +rules,power_fridge,4,4,0,0,0,0,0,15.5                           
+      4 +rules,motion_hallway,2,2,0,0,0,0,0,2.0                          
+      5 +rules,door_front,4,4,0,0,0,0,0,5.0                              
+      6 +iforest,temp_living_room,4,2,2,1,0,0,3,131.0                    
+      7 +iforest,power_fridge,4,2,2,0,0,0,2,95.0                         
+      8 +iforest,motion_hallway,2,0,2,2,0,2,4,                           
+      9 +iforest,door_front,4,0,4,0,0,0,4,                               
+  ⎿  … 5 more files changed
+  ⎿  (timeout 10m)
+
+● The rules detect all 14 val anomalies with 0 false alarms. Isolation Forest
+  detects only 4 of 14. Before reporting, I'll check that this isn't a bug,
+  starting with the Isolation Forest tuning log.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)  ⎿  Added 13 lines
+      345  
+      346  **Comparison table:** detection per sensor/type, false alarms 
+           (total, per day, cross-sensor, on benign events), median delay
+           , model size, **inference time per minute**, number of tuned p
+           arameters, explainability.
+      347  
+      348 +### Val results (first run, seed 42; `outputs/val_*.csv`)     
+      349 +                                                              
+      350 +| Model | Detected | False alarms | Benign FA | Cross-sensor F
+          +A | Total errors | Size | ms / minute | Tuned params |        
+      351 +|---|---|---|---|---|---|---|---|---|                         
+      352 +| Rules | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0006 | 3 |   
+      353 +| Isolation Forest | 4/14 | 3 | 2 | 0 | 13 | 11,477 KB | 0.019
+          + | 4 |                                                        
+      354 +                                                              
+      355 +- **Tuned rules:** d = 0.5 °C, r = 0.2 °C/h, D = 60 min. All r
+          +ule grid points tied on errors; the tie-break chose the lowest
+          + delay.                                                       
+      356 +- **Tuned IF percentiles:** temp p99.95, fridge p99.9, motion 
+          +p99.99, door p99.99.                                          
+      357 +- **Median delay (rules):** temp 27.5, fridge 15.5, motion 2, 
+          +door 5 min.                                                   
+      358 +- **IF detected only** heating failure 2/2 and power loss 2/2 
+          +(delay ~95–131 min). It missed spikes, stuck-on, intrusion, an
+          +d both door types.                                            
+      359 +- **Selected: rules** (fewest total val errors).              
+      360 +                                                              
+      361  - **Known limitation:** IF scores each minute independently. D
+           uration is only captured where a feature encodes it (`fridge_m
+           ode_minutes`, `door_open_minutes`, `temp_rate_60`).
+      362  
+      363  ---
+
+● I ran detect_anomalies.py (about 40 s). It used only train and val; test was
+  never loaded. The rules win clearly.
+
+  Val results
+
+  ┌──────────┬─────────┬───────┬───────┬────────────┬───────┬─────┬───────┐
+  │          │         │ False │ On be │            │ Total │     │ Time  │
+  │  Model   │ Detecte │  alar │ nign  │ Cross-sens │  erro │ Siz │ per m │
+  │          │    d    │  ms   │ event │     or     │  rs   │  e  │ inute │
+  │          │         │       │   s   │            │       │     │       │
+  ├──────────┼─────────┼───────┼───────┼────────────┼───────┼─────┼───────┤
+  │ Rules    │ 14/14   │ 0     │ 0     │ 0          │ 0     │ 3.2 │ 0.000 │
+  │          │         │       │       │            │       │  KB │ 6 ms  │
+  ├──────────┼─────────┼───────┼───────┼────────────┼───────┼─────┼───────┤
+  │          │         │ 3     │       │            │       │ 11. │       │
+  │ Isolatio │ 4/14    │ (0.43 │ 2     │ 0          │ 13    │ 5   │ 0.019 │
+  │ n Forest │         │  per  │       │            │       │ MB  │  ms   │
+  │          │         │ day)  │       │            │       │     │       │
+  └──────────┴─────────┴───────┴───────┴────────────┴───────┴─────┴───────┘
+
+  ┌─────────────┬──────────────────────────┬────────────────────────────────┐
+  │   Sensor    │ Rules: detected / false  │ Isolation Forest: detected /   │
+  │             │  alarms / median delay   │  false alarms / median delay   │
+  ├─────────────┼──────────────────────────┼────────────────────────────────┤
+  │ Temperature │ 4/4 / 0 / 27.5 min       │ 2/4 / 1 / 131 min              │
+  ├─────────────┼──────────────────────────┼────────────────────────────────┤
+  │ Fridge      │ 4/4 / 0 / 15.5 min       │ 2/4 / 0 / 95 min               │
+  ├─────────────┼──────────────────────────┼────────────────────────────────┤
+  │ Motion      │ 2/2 / 0 / 2 min          │ 0/2 / 2 (weekend guests) / –   │
+  ├─────────────┼──────────────────────────┼────────────────────────────────┤
+  │ Door        │ 4/4 / 0 / 5 min          │ 0/4 / 0 / –                    │
+  └─────────────┴──────────────────────────┴────────────────────────────────┘
+
+  - Tuned values:
+    - Rules: d = 0.5 °C, r = 0.2 °C/h, D = 60 min. Every grid point had 0
+      errors, so the delay tie-break chose these.
+    - Isolation Forest thresholds: p99.9 to p99.99 of the train scores.
+  - Selected: rules. The model is saved to artifacts/selected_model.joblib. The
+    alerts, comparison, per-sensor, per-type and tuning-log CSVs are in
+    outputs/, and the results are in design.md.
+
+  Why Isolation Forest does poorly (from the tuning log, not a bug)
+
+  - No threshold works: for door, the p99.0 threshold catches all 4 anomalies
+    but raises 24 false alarms, while p99.5 and above catch 0–2. It's the same
+    pattern on every sensor, so there's no threshold that separates anomalies
+    from normal minutes.
+  - The anomalies in train look less unusual: train contains unlabelled
+    anomalies, so long fridge periods (up to 137 min) and long door openings
+    appear in train. A 103-min fridge period then ranks only "above 99.7% of
+    train", not extreme.
+  - Extra inputs dilute the signal: each tree splits on randomly chosen inputs,
+    so the one input that matters (e.g. door_open_minutes) is used for only
+    about 1 split in 6 next to the 5 time inputs. Spikes and night door openings
+    get lost this way.
+
+  Two caveats for the README (medium priority)
+
+  1. The rules' perfect val score is optimistic. The same design process wrote
+     both the simulator and the rules: the schedule and thresholds match how the
+     data was generated. Test will give a fairer number, and real homes would
+     be messier.
+  2. Val is small, with 14 anomalies. "0 errors" means none of these 14 were
+     missed, not that the rules never miss.
+
+  Question: your plan says a third model is decided "based on the results".
+  Options:
+  - (a) Stop at two models. The comparison already makes the point: simple,
+    physics-based rules beat a generic detector when anomalies are well defined.
+  - (b) Improve Isolation Forest fairly: fewer, sensor-specific inputs and a
+    larger sample size. That would show whether its weakness is the method or
+    the setup.
+  - (c) Add a third model, such as a statistical detector per context (robust
+    z-scores per hour × day type).
+
+  I'd recommend (b), kept small. It makes the comparison fair before we draw
+  conclusions.
+
+✻ Baked for 5m 22s · done 5:20 PM
+  ⎿  Referenced file docs\design.md
+  ⎿  Referenced file detect_anomalies.py
+  ⎿  Read config.py (190 lines)
+  ⎿  Referenced file 
+     ..\..\AppData\Local\Temp\claude\C--Users-Gracy-Projects-Anomaly-Detection\1
+     000db6d-2780-4658-9c27-9420fc653ff7\scratchpad\build_notebook.py
+  ⎿  Read features.py (305 lines)
+  ⎿  Skills restored (dataviz)
+
+● Compacted while idle, before the prompt cache expired · turn off with 
+  "idleCompaction": false in settings.json
+
+❯  go with (b), keep it small: one revised Isolation forest with fewer senosr   
+  specific inputs and keep the sample size resonable.Report it next to the      
+  origianlas                                                                    
+      v2; dont reiterate. I owuld like add another model which is Control       
+  charts(EWMA and CUSUM) as a third model. The reason being: the rule based     
+      detector has design bias and isolation currently is unfair beacuse its    
+  input is diluted for now. Control charts are another classic and lightweight  
+  methid that can capture the gradual motion like heating failure better. Fit   
+  the chart paramters on train only, tune on limits of val with the grid and    
+  let me know how each sensor react to it. Give  me a comparion of all models.  
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Now the config additions and code.
+
+● Update(config.py)
+  ⎿  Added 5 lines
+      183  
+      184  IFOREST = {"n_estimators": 200}
+      185  IF_PERCENTILE_GRID = [99.0, 99.5, 99.9, 99.95, 99.99]   # of t
+           rain scores
+      186 +IFOREST_V2 = {"n_estimators": 200, "max_samples": 1024}  # few
+          +er, sensor-specific inputs                                    
+      187  
+      188 +# Control charts: fixed textbook constants; only the limit (an
+          +d chart type) is tuned on val                                 
+      189 +CHARTS = {"ewma_lambda": 0.2, "cusum_k": 0.5}                 
+      190 +CHART_GRID = {"ewma": [3, 4, 5, 6, 8], "cusum": [5, 10, 20, 40
+          +, 80]}   # least -> most conservative                         
+      191 +                                                              
+      192  # Alerts and scoring
+      193  ALERT_MERGE_GAP_MINUTES = 10
+      194  GRACE_MINUTES = 15
+
+  Made 2 scratchpad edits +346, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      "C:/Users/Gracy/AppData/Local/Temp/claude/C--Users-Gracy-Projects-Anomaly-
+      Detection/1000d…)
+  ⎿  ok
+     Tuned rules: {'temp_living_room': {'heating_dev_degc': 0.5, 'heating_r
+     ate_degc_h': 0.2}, 'power_fridge': {}, 'motion_hallway': {'intrusion_n
+     … +68 lines (ctrl+o to expand)
+  ⎿  Created outputs\alerts_charts_val.csv (+19 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +temp_living_room,charts,2024-01-22 06:55:00,2024-01-22 11:04:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+       3 +power_fridge,charts,2024-01-22 18:13:00,2024-01-22 19:58:00,EWM
+         +A of power_fridge below -6 sigma                               
+       4 +power_fridge,charts,2024-01-23 01:07:00,2024-01-23 01:48:00,EWM
+         +A of fridge_mode_minutes above +6 sigma                        
+       5 +power_fridge,charts,2024-01-23 06:11:00,2024-01-23 08:36:00,EWM
+         +A of power_fridge below -6 sigma                               
+       6 +temp_living_room,charts,2024-01-23 06:45:00,2024-01-23 09:11:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+       7 +temp_living_room,charts,2024-01-23 17:32:00,2024-01-23 21:04:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+       8 +temp_living_room,charts,2024-01-24 07:14:00,2024-01-24 09:24:00
+         +,CUSUM of temp_dev below -40 (CUSUM h)                         
+       9 +temp_living_room,charts,2024-01-24 18:02:00,2024-01-24 21:26:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+      10 +door_front,charts,2024-01-24 20:56:00,2024-01-25 01:16:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      11 +temp_living_room,charts,2024-01-25 05:46:00,2024-01-25 10:52:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+      12 +motion_hallway,charts,2024-01-25 16:56:00,2024-01-25 18:39:00,C
+         +USUM of motion_hallway above +80 (CUSUM h)                     
+      13 +temp_living_room,charts,2024-01-25 18:08:00,2024-01-25 21:51:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+      14 +temp_living_room,charts,2024-01-26 05:48:00,2024-01-26 06:00:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+      15 +temp_living_room,charts,2024-01-26 06:52:00,2024-01-26 10:36:00
+         +,CUSUM of temp_resid above +40 (CUSUM h)                       
+      16 +temp_living_room,charts,2024-01-26 10:46:00,2024-01-28 23:59:00
+         +,CUSUM of temp_dev below -40 (CUSUM h)                         
+      17 +power_fridge,charts,2024-01-27 05:13:00,2024-01-27 06:09:00,EWM
+         +A of fridge_mode_minutes above +6 sigma                        
+      18 +motion_hallway,charts,2024-01-27 23:05:00,2024-01-27 23:47:00,C
+         +USUM of motion_hallway above +80 (CUSUM h)                     
+      19 +door_front,charts,2024-01-28 19:59:00,2024-01-28 23:59:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+  ⎿  Created outputs\alerts_iforest_v2_val.csv (+18 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +power_fridge,iforest_v2,2024-01-22 19:37:00,2024-01-22 19:52:00
+         +,"fridge_mode_minutes = 100.00, above 99.7% of train"          
+       3 +power_fridge,iforest_v2,2024-01-23 07:40:00,2024-01-23 08:28:00
+         +,"fridge_mode_minutes = 100.00, above 99.7% of train"          
+       4 +temp_living_room,iforest_v2,2024-01-23 17:46:00,2024-01-23 17:4
+         +6:00,"temp_dev = 1.36, above 99.9% of train"                   
+       5 +door_front,iforest_v2,2024-01-24 20:53:00,2024-01-24 21:36:00,"
+         +door_open_minutes = 4.00, above 99.5% of train"                
+       6 +temp_living_room,iforest_v2,2024-01-25 05:46:00,2024-01-25 05:4
+         +6:00,"temp_dev = 6.92, above 100.0% of train"                  
+       7 +temp_living_room,iforest_v2,2024-01-26 05:48:00,2024-01-26 05:4
+         +8:00,"temp_dev = 5.59, above 100.0% of train"                  
+       8 +temp_living_room,iforest_v2,2024-01-26 11:46:00,2024-01-26 11:4
+         +6:00,"temp_resid = -0.39, below 99.9% of train"                
+       9 +temp_living_room,iforest_v2,2024-01-26 12:06:00,2024-01-26 12:1
+         +4:00,"temp_rate_60 = -0.86, below 100.0% of train"             
+      10 +temp_living_room,iforest_v2,2024-01-26 12:26:00,2024-01-26 12:5
+         +4:00,"temp_dev = -2.05, below 99.9% of train"                  
+      11 +motion_hallway,iforest_v2,2024-01-27 20:55:00,2024-01-27 21:25:
+         +00,"motion_usual = 0.39, above 100.0% of train"                
+      12 +motion_hallway,iforest_v2,2024-01-27 21:55:00,2024-01-27 21:59:
+         +00,"motion_15 = 11.00, above 99.8% of train"                   
+      13 +temp_living_room,iforest_v2,2024-01-28 09:21:00,2024-01-28 09:2
+         +1:00,"temp_rate_60 = -0.85, below 100.0% of train"             
+      14 +temp_living_room,iforest_v2,2024-01-28 09:36:00,2024-01-28 09:4
+         +0:00,"temp_rate_60 = -0.90, below 100.0% of train"             
+      15 +temp_living_room,iforest_v2,2024-01-28 09:50:00,2024-01-28 09:5
+         +8:00,"temp_rate_60 = -0.91, below 100.0% of train"             
+      16 +temp_living_room,iforest_v2,2024-01-28 10:11:00,2024-01-28 10:4
+         +4:00,"temp_rate_60 = -0.88, below 100.0% of train"             
+      17 +temp_living_room,iforest_v2,2024-01-28 11:00:00,2024-01-28 11:0
+         +0:00,"temp_resid = 0.55, above 99.9% of train"                 
+      18 +door_front,iforest_v2,2024-01-28 20:00:00,2024-01-28 20:54:00,"
+         +door_open_minutes = 5.00, above 99.6% of train"                
+  ⎿  Created outputs\val_chart_reactions.csv (+9 -0)
+      1 +sensor,setting,hits,misses,false_alarms,errors,median_delay_min 
+      2 +door_front,cusum 80,2,2,0,2,4.5                                 
+      3 +door_front,ewma 8,3,1,9,10,1.0                                  
+      4 +motion_hallway,cusum 80,1,1,1,2,3.0                             
+      5 +motion_hallway,ewma 8,2,0,8,8,1.5                               
+      6 +power_fridge,cusum 80,4,0,1,1,16.5                              
+      7 +power_fridge,ewma 6,4,0,0,0,10.0                                
+      8 +temp_living_room,cusum 20,4,0,6,6,0.0                           
+      9 +temp_living_room,ewma 8,4,0,10,10,13.0                          
+  ⎿  Updated outputs\val_comparison.csv (+3 -1)
+      1  model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,be
+         nign_fa,total_errors,median_delay_min (median over sensors),mode
+         l_size_kb,ms_per_minute,tuned_params,explainability
+      2  rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0006,3,rule name + thresho
+         ld (e.g. 'compressor running > 30 min')
+      3 -iforest,4/14,10,3,0.43,0,2,13,113.0,11476.7,0.0194,4,"most extre
+        -me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        -')"                                                             
+      3 +iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0219,4,"most extre
+        +me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        +')"                                                             
+      4 +iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0247,4,most extrem
+        +e feature vs train                                              
+      5 +charts,11/14,3,7,1.0,2,1,10,3.75,14.1,0.0065,8,chart + signal + 
+        +side (e.g. 'CUSUM of temp_dev below -20')                       
+  ⎿  Updated outputs\val_per_sensor.csv (+8 -0)
+       7  iforest,power_fridge,4,2,2,0,0,0,2,95.0
+       8  iforest,motion_hallway,2,0,2,2,0,2,4,
+       9  iforest,door_front,4,0,4,0,0,0,4,
+      10 +iforest_v2,temp_living_room,4,4,0,1,0,0,1,42.0                 
+      11 +iforest_v2,power_fridge,4,2,2,0,0,0,2,91.0                     
+      12 +iforest_v2,motion_hallway,2,0,2,2,0,2,4,                       
+      13 +iforest_v2,door_front,4,2,2,0,0,0,2,3.5                        
+      14 +charts,temp_living_room,4,4,0,6,2,0,6,0.0                      
+      15 +charts,power_fridge,4,4,0,0,0,0,0,10.0                         
+      16 +charts,motion_hallway,2,1,1,1,0,1,2,3.0                        
+      17 +charts,door_front,4,2,2,0,0,0,2,4.5                            
+  ⎿  … 6 more files changed (part of the diff is unavailable)
+  ⎿  (timeout 10m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I caught a real bug: CUSUM wasn't resetting after a signal, so the lower sum
+  stayed above the limit for 2.5 days after the 01‑26 heating failure, merging
+  both failures into one giant alert. I'll fix the reset logic along with the
+  reaction-table tie-break issue.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+     Tuned charts: {'temp_living_room': ('ewma', 8), 'power_fridge': ('ewma
+     ', 6), 'motion_hallway': ('cusum', 80), 'door_front': ('cusum', 80)}
+     … +61 lines (ctrl+o to expand)
+  ⎿  Updated detect_anomalies.py (+16 -9)
+      280      return (x - group_lookup(s["center"], f, groups)) / group_
+           lookup(s["scale"], f, groups)
+      281  
+      282  
+      283 -def run_chart(z, chart):                                      
+      284 -    """Upper and lower chart statistic per minute, in limit un
+          -its. Missing minutes hold the state."""                       
+      283 +def run_chart(z, chart, limit):                               
+      284 +    """Upper and lower chart statistic per minute, in limit un
+          +its. Missing minutes hold the state.                          
+      285 +                                                              
+      286 +    CUSUM restarts at 0 after a signal (standard practice); ot
+          +herwise one long anomaly                                      
+      287 +    builds a sum that stays above the limit for days.         
+      288 +    """                                                       
+      289      up, lo = np.zeros(len(z)), np.zeros(len(z))
+      290      lam, k = cfg.CHARTS["ewma_lambda"], cfg.CHARTS["cusum_k"]
+      291      sigma = np.sqrt(lam / (2 - lam))                  # asympt
+           otic EWMA sd for unit-variance z
+     ...
+      297              else:
+      298                  s_hi, s_lo = max(0.0, s_hi + v - k), max(0.0, 
+           s_lo - v - k)
+      299          up[i], lo[i] = (e / sigma, -e / sigma) if chart == "ew
+           ma" else (s_hi, s_lo)
+      300 +        if chart == "cusum":                                  
+      301 +            s_hi, s_lo = (0.0 if s_hi > limit else s_hi), (0.0
+          + if s_lo > limit else s_lo)                                   
+      302      return up, lo
+      303  
+      304  
+      299 -def chart_statistics(f, sensor, stats, chart):                
+      300 -    """Chart statistics for every stream of one sensor (comput
+          -ed once, reused across limits)."""                            
+      305 +def chart_statistics(f, sensor, stats, chart, limit):         
+      306 +    """Chart statistics for every stream of one sensor."""    
+      307      out = []
+      308      for col, side, groups in CHART_STREAMS[sensor]:
+      303 -        up, lo = run_chart(standardize(f, col, groups, stats),
+          - chart)                                                       
+      309 +        up, lo = run_chart(standardize(f, col, groups, stats),
+          + chart, limit)                                                
+      310          out.append((col, side, pd.Series(up, index=f.index), p
+           d.Series(lo, index=f.index)))
+      311      return out
+      312  
+     ...
+      325  
+      326  def chart_flags(f, sensor, stats, setting):
+      327      chart, limit = setting
+      322 -    return chart_flags_from_stats(chart_statistics(f, sensor, 
+          -stats, chart), chart, limit)                                  
+      328 +    return chart_flags_from_stats(chart_statistics(f, sensor, 
+          +stats, chart, limit), chart, limit)                           
+      329  
+      330  
+     … 21 more lines (ctrl+o to expand)
+  ⎿  Updated outputs\alerts_charts_val.csv (+23 -14)
+       1  sensor,model,start,end,reason
+       2 -temp_living_room,charts,2024-01-22 06:55:00,2024-01-22 11:04:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+       2 +temp_living_room,charts,2024-01-22 06:44:00,2024-01-22 06:52:00
+         +,EWMA of temp_resid above +8 sigma                             
+       3  power_fridge,charts,2024-01-22 18:13:00,2024-01-22 19:58:00,EWM
+          A of power_fridge below -6 sigma
+       4  power_fridge,charts,2024-01-23 01:07:00,2024-01-23 01:48:00,EWM
+          A of fridge_mode_minutes above +6 sigma
+       5  power_fridge,charts,2024-01-23 06:11:00,2024-01-23 08:36:00,EWM
+          A of power_fridge below -6 sigma
+       6 -temp_living_room,charts,2024-01-23 06:45:00,2024-01-23 09:11:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+       7 -temp_living_room,charts,2024-01-23 17:32:00,2024-01-23 21:04:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+       8 -temp_living_room,charts,2024-01-24 07:14:00,2024-01-24 09:24:00
+         -,CUSUM of temp_dev below -40 (CUSUM h)                         
+       9 -temp_living_room,charts,2024-01-24 18:02:00,2024-01-24 21:26:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+      10 -door_front,charts,2024-01-24 20:56:00,2024-01-25 01:16:00,CUSUM
+         - of door_front above +80 (CUSUM h)                             
+      11 -temp_living_room,charts,2024-01-25 05:46:00,2024-01-25 10:52:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+      12 -motion_hallway,charts,2024-01-25 16:56:00,2024-01-25 18:39:00,C
+         -USUM of motion_hallway above +80 (CUSUM h)                     
+      13 -temp_living_room,charts,2024-01-25 18:08:00,2024-01-25 21:51:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+      14 -temp_living_room,charts,2024-01-26 05:48:00,2024-01-26 06:00:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+      15 -temp_living_room,charts,2024-01-26 06:52:00,2024-01-26 10:36:00
+         -,CUSUM of temp_resid above +40 (CUSUM h)                       
+      16 -temp_living_room,charts,2024-01-26 10:46:00,2024-01-28 23:59:00
+         -,CUSUM of temp_dev below -40 (CUSUM h)                         
+       6 +temp_living_room,charts,2024-01-23 06:40:00,2024-01-23 06:48:00
+         +,EWMA of temp_resid above +8 sigma                             
+       7 +temp_living_room,charts,2024-01-23 17:25:00,2024-01-23 17:32:00
+         +,EWMA of temp_resid above +8 sigma                             
+       8 +temp_living_room,charts,2024-01-24 07:05:00,2024-01-24 07:18:00
+         +,EWMA of temp_dev below -8 sigma                               
+       9 +temp_living_room,charts,2024-01-24 17:57:00,2024-01-24 18:07:00
+         +,EWMA of temp_resid above +8 sigma                             
+      10 +door_front,charts,2024-01-24 20:56:00,2024-01-24 20:56:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      11 +door_front,charts,2024-01-24 21:17:00,2024-01-24 21:17:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      12 +temp_living_room,charts,2024-01-25 05:46:00,2024-01-25 05:52:00
+         +,EWMA of temp_resid above +8 sigma                             
+      13 +temp_living_room,charts,2024-01-25 06:45:00,2024-01-25 06:46:00
+         +,EWMA of temp_resid above +8 sigma                             
+      14 +motion_hallway,charts,2024-01-25 16:56:00,2024-01-25 16:56:00,C
+         +USUM of motion_hallway above +80 (CUSUM h)                     
+      15 +temp_living_room,charts,2024-01-25 17:58:00,2024-01-25 18:13:00
+         +,EWMA of temp_resid above +8 sigma                             
+      16 +temp_living_room,charts,2024-01-26 05:48:00,2024-01-26 05:53:00
+         +,EWMA of temp_resid above +8 sigma                             
+      17 +temp_living_room,charts,2024-01-26 06:53:00,2024-01-26 06:57:00
+         +,EWMA of temp_resid above +8 sigma                             
+      18 +temp_living_room,charts,2024-01-26 10:43:00,2024-01-26 14:30:00
+         +,EWMA of temp_dev below -8 sigma                               
+      19  power_fridge,charts,2024-01-27 05:13:00,2024-01-27 06:09:00,EWM
+          A of fridge_mode_minutes above +6 sigma
+      18 -motion_hallway,charts,2024-01-27 23:05:00,2024-01-27 23:47:00,C
+         -USUM of motion_hallway above +80 (CUSUM h)                     
+      19 -door_front,charts,2024-01-28 19:59:00,2024-01-28 23:59:00,CUSUM
+         - of door_front above +80 (CUSUM h)                             
+      20 +temp_living_room,charts,2024-01-27 07:02:00,2024-01-27 07:09:00
+         +,EWMA of temp_resid above +8 sigma                             
+      21 +motion_hallway,charts,2024-01-27 23:05:00,2024-01-27 23:05:00,C
+         +USUM of motion_hallway above +80 (CUSUM h)                     
+      22 +temp_living_room,charts,2024-01-28 06:30:00,2024-01-28 06:37:00
+         +,EWMA of temp_resid above +8 sigma                             
+      23 +temp_living_room,charts,2024-01-28 08:24:00,2024-01-28 12:10:00
+         +,EWMA of temp_dev below -8 sigma                               
+      24 +door_front,charts,2024-01-28 19:59:00,2024-01-28 19:59:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      25 +door_front,charts,2024-01-28 20:11:00,2024-01-28 20:11:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      26 +door_front,charts,2024-01-28 20:23:00,2024-01-28 20:23:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+     … 2 more lines (ctrl+o to expand)
+  ⎿  Updated outputs\val_chart_reactions.csv (+2 -2)
+      3  door_front,ewma 8,3,1,9,10,1.0
+      4  motion_hallway,cusum 80,1,1,1,2,3.0
+      5  motion_hallway,ewma 8,2,0,8,8,1.5
+      6 -power_fridge,cusum 80,4,0,1,1,16.5                              
+      6 +power_fridge,cusum 80,4,0,1,1,35.5                              
+      7  power_fridge,ewma 6,4,0,0,0,10.0
+      8 -temp_living_room,cusum 20,4,0,6,6,0.0                           
+      8 +temp_living_room,cusum 80,2,2,11,13,40.0                        
+      9  temp_living_room,ewma 8,4,0,10,10,13.0
+  ⎿  Updated outputs\val_comparison.csv (+4 -4)
+      1  model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,be
+         nign_fa,total_errors,median_delay_min (median over sensors),mode
+         l_size_kb,ms_per_minute,tuned_params,explainability
+      2 -rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0006,3,rule name + thresho
+        -ld (e.g. 'compressor running > 30 min')                         
+      3 -iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0219,4,"most extre
+        -me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        -')"                                                             
+      4 -iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0247,4,most extrem
+        -e feature vs train                                              
+      5 -charts,11/14,3,7,1.0,2,1,10,3.75,14.1,0.0065,8,chart + signal + 
+        -side (e.g. 'CUSUM of temp_dev below -20')                       
+      2 +rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0004,3,rule name + thresho
+        +ld (e.g. 'compressor running > 30 min')                         
+      3 +iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0182,4,"most extre
+        +me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        +')"                                                             
+      4 +iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0231,4,most extrem
+        +e feature vs train                                              
+      5 +charts,11/14,3,11,1.57,1,1,14,7.25,14.1,0.0064,8,chart + signal 
+        ++ side (e.g. 'CUSUM of temp_dev below -20')                     
+  ⎿  Updated outputs\val_per_sensor.csv (+1 -1)
+      11  iforest_v2,power_fridge,4,2,2,0,0,0,2,91.0
+      12  iforest_v2,motion_hallway,2,0,2,2,0,2,4,
+      13  iforest_v2,door_front,4,2,2,0,0,0,2,3.5
+      14 -charts,temp_living_room,4,4,0,6,2,0,6,0.0                      
+      14 +charts,temp_living_room,4,4,0,10,1,0,10,13.0                   
+      15  charts,power_fridge,4,4,0,0,0,0,0,10.0
+      16  charts,motion_hallway,2,1,1,1,0,1,2,3.0
+      17  charts,door_front,4,2,2,0,0,0,2,4.5
+  ⎿  … 3 more files changed (part of the diff is unavailable)
+  ⎿  (timeout 10m)
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 19 lines, removed 1 line
+      321  | Missing inputs | Any NaN input (offline sensor, unknown `min
+           utes_since_door_open`) → that detector skips the minute |
+      322  | Explanation | Each alert reports its most extreme input feat
+           ure compared with the train distribution (e.g. "fridge_mode_mi
+           nutes = 85, above 99.9% of train"). SHAP is a README extension
+            |
+      323  
+      324 -### Minute flags → alerts (both models)                       
+      324 +### Isolation Forest v2 (one fair revision; no further iterati
+          +on)                                                           
+      325 +Reason: v1 inputs were diluted by 5 generic context columns.  
+      326 +| Aspect | Decision |                                         
+      327 +|---|---|                                                     
+      328 +| Inputs | temp: `temp_dev`, `temp_resid`, `temp_rate_60` · fr
+          +idge: `power_fridge`, `fridge_mode_minutes` · motion: `motion_
+          +15`, `minutes_since_door_open`, `motion_usual` · door: `door_o
+          +pen_minutes`, `door_usual` |                                  
+      329 +| Learned context | `motion_usual` / `door_usual` = share of a
+          +ctive minutes per (day type, hour) on train, Laplace-smoothed 
+          +(+0.5 / +1). No labels and no configured schedule are used |  
+      330 +| Settings | 200 trees, `max_samples` = 1024 (v1: 256); same t
+          +hreshold grid and tuning as v1 |                              
+      331 +                                                              
+      332 +### Control charts (EWMA / CUSUM)                             
+      333 +Reason: classic, lightweight, and less designer-biased than ru
+          +les; expected to suit gradual drifts (heating failure).       
+      334 +| Aspect | Decision |                                         
+      335 +|---|---|                                                     
+      336 +| Signals (z-scores) | temp: `temp_resid` (two-sided, global m
+          +edian/MAD) and `temp_dev` (lower side, median/MAD per baseline
+          + group × hour) · fridge: `power_fridge` (two-sided) and `fridg
+          +e_mode_minutes` (upper), both median/MAD per fridge mode · mot
+          +ion / door: 0/1 reading standardised by its learned per-(day t
+          +ype, hour) rate, `(x − p) / √(p(1 − p))`, upper side |        
+      337 +| Fit on train | Centres, scales (MAD × 1.4826, with floors: t
+          +emp_resid 0.05 °C, temp_dev 0.1 °C, power 0.5 W, run length 1 
+          +min) and rates. Unlabelled train |                            
+      338 +| Fixed constants | EWMA λ = 0.2 (limit in asymptotic EWMA σ);
+          + CUSUM k = 0.5 |                                              
+      339 +| Tuned on val | Chart type (EWMA or CUSUM) and limit per sens
+          +or: EWMA L ∈ {3, 4, 5, 6, 8}; CUSUM h ∈ {5, 10, 20, 40, 80}. S
+          +ame objective and tie-breaks |                                
+      340 +| Details | CUSUM restarts at 0 after a signal (without this, 
+          +one heating failure kept the chart above the limit for 2.5 day
+          +s). Missing minutes hold the chart state. A sensor alerts when
+          + any of its signals crosses the limit. Reason = chart + signal
+          + + side |                                                     
+      341 +                                                              
+      342 +### Minute flags → alerts (all models)                        
+      343  - An alert starts at the first flagged minute, which is when i
+           t is sent in real time.
+      344  - Flagged minutes on the same sensor < 10 min apart are merged
+            into one alert. Merging only extends an alert already sent.
+      345  - Alert record: `sensor, model, start, end, reason`, written t
+           o `outputs/alerts_<model>_<split>.csv` (the task's "detected a
+           nomalies" output).
+
+● Update(docs\design.md)
+  ⎿  Added 18 lines
+      378  
+      379  - **Known limitation:** IF scores each minute independently. D
+           uration is only captured where a feature encodes it (`fridge_m
+           ode_minutes`, `door_open_minutes`, `temp_rate_60`).
+      380  
+      381 +### Val results (all four models, seed 42; `outputs/val_*.csv`
+          +)                                                             
+      382 +                                                              
+      383 +| Model | Detected | False alarms | Benign FA | Cross-sensor F
+          +A | Total errors | Size | ms / minute | Tuned params |        
+      384 +|---|---|---|---|---|---|---|---|---|                         
+      385 +| Rules | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0004 | 3 |   
+      386 +| Control charts | 11/14 | 11 | 1 | 1 | 14 | 14 KB | 0.006 | 8
+          + |                                                            
+      387 +| IF v2 | 8/14 | 3 | 2 | 0 | 9 | 20,864 KB | 0.023 | 4 |      
+      388 +| IF v1 | 4/14 | 3 | 2 | 0 | 13 | 11,482 KB | 0.018 | 4 |     
+      389 +                                                              
+      390 +- **Tuned:** IF v2 percentiles temp p99.95, fridge p99.5, moti
+          +on p99.95, door p99.5. Charts: temp EWMA 8, fridge EWMA 6, mot
+          +ion CUSUM 80, door CUSUM 80.                                  
+      391 +- **IF v2 vs v1:** +4 detections (temp spikes 2/2, door left o
+          +pen 2/2), same false alarms. Still misses stuck-on, intrusion 
+          +and night door openings. Size nearly doubled (larger `max_samp
+          +les`).                                                        
+      392 +- **Charts per sensor:**                                      
+      393 +  - Fridge: 4/4, 0 FA (EWMA 6; delay 10 min, faster than rules
+          +' 15.5).                                                      
+      394 +  - Temperature: 4/4, but 10 FA. 9 of them are `temp_resid` on
+          + the daily heat-up ramps (06:30–07:10, 17:25–18:15): rising te
+          +mperature keeps the residual positive for many minutes, which 
+          +the chart accumulates. Heating failures were caught after 26–2
+          +7 min, about the same as rules (no gain for the gradual drift)
+          +.                                                             
+      395 +  - Motion: 1/2 at CUSUM 80; lower limits catch both but add 5
+          +–63 FA. 1 FA on weekend guests.                               
+      396 +  - Door: left open 2/2, night openings 0/2. A 1–2 min night o
+          +pening adds too little to the chart before it ends; limits tha
+          +t catch it add 3–19 FA.                                       
+      397 +- **Selected: rules** (still fewest total val errors). Same ci
+          +rcularity caveat as before.                                   
+      398 +                                                              
+      399  ---
+      400  
+      401  ## README Carry-Over
+
+● I added Isolation Forest v2 and the control charts, ran all four models, and
+  the rules are still the best on val by a wide margin. Test was never loaded.
+
+  Before the final run I found and fixed a bug in the control charts. CUSUM
+  wasn't restarting at 0 after an alarm, so after the heating failure on 01‑26
+  it stayed in alarm for 2.5 days. That made it look better than it was. All
+  numbers below are after the fix.
+
+  All models on val
+
+  ┌─────────┬──────────┬────────────────┬────────┬────────┬──────┬────────┐
+  │         │          │                │ Total  │ Median │      │ Time   │
+  │  Model  │ Detected │  False alarms  │ errors │  delay │ Size │  per   │
+  │         │          │                │        │        │      │ minute │
+  ├─────────┼──────────┼────────────────┼────────┼────────┼──────┼────────┤
+  │ Rules   │ 14/14    │ 0              │ 0      │ 10 min │ 3 KB │ 0.0004 │
+  │         │          │                │        │        │      │  ms    │
+  ├─────────┼──────────┼────────────────┼────────┼────────┼──────┼────────┤
+  │         │          │ 3 (2 on        │        │        │ 20.9 │ 0.023  │
+  │ IF v2   │ 8/14     │ weekend        │ 9      │ 42 min │  MB  │ ms     │
+  │         │          │ guests)        │        │        │      │        │
+  ├─────────┼──────────┼────────────────┼────────┼────────┼──────┼────────┤
+  │         │          │ 3 (2 on        │        │ 113    │ 11.5 │ 0.018  │
+  │ IF v1   │ 4/14     │ weekend        │ 13     │ min    │  MB  │ ms     │
+  │         │          │ guests)        │        │        │      │        │
+  ├─────────┼──────────┼────────────────┼────────┼────────┼──────┼────────┤
+  │         │          │ 11 (1          │        │        │      │        │
+  │ Control │ 11/14    │ cross-sensor,  │ 14     │ 7 min  │ 14   │ 0.006  │
+  │  charts │          │ 1 on weekend   │        │        │ KB   │ ms     │
+  │         │          │ guests)        │        │        │      │        │
+  └─────────┴──────────┴────────────────┴────────┴────────┴──────┴────────┘
+
+  (IF = Isolation Forest. Median delay is the median of the per-sensor medians.)
+
+  Detected per anomaly type
+
+  ┌─────────────────────┬───────┬────────────────┬───────┬───────┐
+  │    Anomaly type     │ Rules │ Control charts │ IF v2 │ IF v1 │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Temperature spike   │ 2/2   │ 2/2            │ 2/2   │ 0/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Heating failure     │ 2/2   │ 2/2            │ 2/2   │ 2/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Fridge power loss   │ 2/2   │ 2/2            │ 2/2   │ 2/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Compressor stuck on │ 2/2   │ 2/2            │ 0/2   │ 0/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Intrusion motion    │ 2/2   │ 1/2            │ 0/2   │ 0/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Door left open      │ 2/2   │ 2/2            │ 2/2   │ 0/2   │
+  ├─────────────────────┼───────┼────────────────┼───────┼───────┤
+  │ Door open at night  │ 2/2   │ 0/2            │ 0/2   │ 0/2   │
+  └─────────────────────┴───────┴────────────────┴───────┴───────┘
+
+  How each sensor reacts to the control charts
+
+  - Fridge: this is where they work best. EWMA catches all 4 with 0 false alarms
+    and a 10 min delay, faster than the rules (15.5 min). CUSUM at its best
+    limit (80) also catches all 4 but adds 1 false alarm.
+  - Temperature: both heating failures were caught after 26–27 min, about the
+    same as the rules. So the expected advantage on gradual drift didn't show.
+    The cost is 10 false alarms: 9 come from the daily heat-up periods, when
+    rising temperature keeps the reading above its recent median and the chart
+    keeps accumulating. EWMA (limit 8) beat CUSUM, which at limit 80 caught only
+    2/4 with 11 false alarms.
+  - Motion: CUSUM at limit 80 catches 1 of 2 intrusions with 1 false alarm.
+    Lower limits catch both but add 5–63 false alarms.
+  - Door: CUSUM catches both "left open" anomalies. Neither chart catches the
+    1–2 min night openings: they end before enough evidence builds up, and any
+    limit low enough to catch them adds 3–19 false alarms.
+
+  IF v2 vs v1
+
+  With 2–3 inputs per sensor in place of the generic time inputs, v2 detects 8
+  instead of 4 with the same 3 false alarms. It newly catches the temperature
+  spikes and "door left open". It still misses compressor stuck-on, intrusion
+  and night door openings, and the larger sample size (1024 instead of 256)
+  nearly doubled its size to 20.9 MB.
+
+  Takeaway
+
+  - Gradual or sustained anomalies (fridge, heating failure, door left open):
+    the control charts handle these well.
+  - Short or context-dependent anomalies (night door openings, intrusion): only
+    the rules catch these reliably. They get the configured schedule, which none
+    of the learned models do.
+
+  The rules are selected again. My earlier caveat still stands: their perfect
+  val score partly reflects that they were designed alongside the simulator, and
+  val has only 14 anomalies.
+
+  design.md now has both new models and the results, and the outputs are in
+  outputs/. Not committed. That ends Stage 5, so please /export the transcript
+  into ai_transcripts/ before we start Stage 6 (Evaluation & selection).
+
+  Question: should Stage 6 report all four models on the final test run, or only
+  the selected rules model with the others as val-only context? I'd report all
+  four. It costs nothing and shows whether the val ranking holds on unseen data.
+
+✻ Churned for 5m 19s · done 6:20 PM
+
+※ recap: You're building an anomaly-detection proof of concept, and Stage 5 (model comparison) is done: the rules model still beat both Isolation Forest versions and the control charts on validation. Next, export the transcript, then decide whether Stage 6 tests all four models or just the rules.
+
+❯ Reviewer finsings on the implemntation:                                       
+  Findings                                                                      
+                                                                                
+  1. High: the rule schedule is the generator's own injection windows, so       
+  "rules 14/14" is partly by construction (evaluation logic)                    
+  - Reason:                                                                     
+    - The configured away window (Tue–Thu 09–17) is almost exactly the          
+  generator's allowed window for intrusion_motion.                              
+    - The night window (00–05) matches door_open_night (00:30–05:00).           
+    - motion_15 ≥ 2 mirrors the generator's guarantee of at least 2 motion      
+  minutes.                                                                      
+    - The ML models get none of this.                                           
+                                                                                
+    So "selected by fewest val errors" was decided by the setup, not by the     
+  method. design.md line 397 says "Same circularity caveat as before", but the  
+  caveat is never actually written anywhere.                                    
+  - Fix:                                                                        
+    a. Add the caveat to design.md Stage 5 and the README carry-over: "the rule 
+  schedule matches the injection windows, so rule recall is an upper bound."    
+    b. Run one sensitivity check that only changes the schedule (away Tue–Thu   
+  08:00–18:30, night 23:30–06:00) and report its val errors next to the main    
+  result.                                                                       
+                                                                                
+  2. Medium: design.md misstates heating-failure delays (contradicts the        
+  outputs)                                                                      
+  - Reason: design.md says charts caught heating failures "after 26–27 min,     
+  about the same as rules". The rules actually alerted after 63 min (A032:      
+  label 10:17, alert 11:20) and 55 min (A034: 07:57 → 08:52), so charts were    
+  about twice as fast. The rules' "temp 27.5 min" median hides this, because it 
+  averages spikes (0 min) with heating failures (~59 min).                      
+  - Fix: In score_sensor, also record the median delay per anomaly type, add it 
+  to val_per_type.csv, and correct the design.md sentence to "charts ~27 min    
+  vs rules ~59 min on heating failure."                                         
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I checked both findings against the outputs and both are correct.
+
+  1. Schedule matches the injection windows (high): confirmed. design.md:397
+     points to a "circularity caveat" that was never written down; it only ever
+     appeared in my chat messages.
+  2. Heating-failure delay (medium): confirmed, and my earlier report was wrong.
+     The rules alerted at 11:20 and 08:52, which is 63 and 55 min after the
+     failures started. The control charts took 26 and 27 min, so they were about
+     twice as fast. The rules' temperature median of 27.5 min hid this because
+     it mixes spikes (0 min) with heating failures.
+
+  Plan:
+  - #1a (high): add the caveat to design.md Stage 5 and the README carry-over:
+    "the rule schedule matches the injection windows, so rule recall is an upper
+    bound". I'll also remove the dangling "same as before" reference.
+  - #1b (high): add one sensitivity run of the rules with only the schedule
+    widened: away Tue–Thu 08:00–18:30, night 23:30–06:00. I'll retune it on val
+    with the same grid, as for the main run. It will be reported next to the
+    main result and won't be used for selection. I'll keep it as a flag in
+    detect_anomalies.py so the main outputs stay unchanged, and the extra rows
+    go in val_sensitivity.csv.
+  - #2 (medium): score_sensor will store each anomaly's delay, and
+    val_per_type.csv will gain a median_delay_min column. I'll correct the
+    design.md sentence to "charts ~27 min vs rules ~59 min on heating failure"
+    and add a per-type delay table.
+
+  Expected effect: the wider windows include the morning departures, the evening
+  returns and late weekend-guest activity. The intrusion rule's check for a
+  recent door opening should cancel out most of the departure and return
+  activity. The likely new false alarms are door openings between 23:30 and
+  06:00 on guest nights, and possibly early risers. I'll report whatever the run
+  shows.
+
+  Shall I go ahead?
+
+✻ Cogitated for 21s · done 6:31 PM
+
+❯ go ahead....give me the whole summary of our run...and is our detauils of how 
+  we implemnted and correcte there have been docuented in design?               
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)  ⎿  ok
+  ⎿  Updated detect_anomalies.py (+33 -17)
+      70  # 2a. Rule detector
+      71  # ============================================================
+      72  def in_window(index, window, days=None):
+      73 -    """True where the minute of day falls in [start, end) (and 
+         -weekday in days, if given)."""                                 
+      73 +    """True where the minute of day falls in [start, end) (and 
+         +weekday in days, if given).                                    
+      74 +                                                               
+      75 +    start > end means the window wraps midnight (e.g. 23:30-06:
+         +00).                                                           
+      76 +    """                                                        
+      77      minute = index.hour * 60 + index.minute
+      75 -    inside = (minute >= window[0]) & (minute < window[1])      
+      78 +    if window[0] <= window[1]:                                 
+      79 +        inside = (minute >= window[0]) & (minute < window[1])  
+      80 +    else:                                                      
+      81 +        inside = (minute >= window[0]) | (minute < window[1])  
+      82      if days is not None:
+      83          inside &= index.day_of_week.isin(days)
+      84      return pd.Series(inside, index=index)
+     ...
+      102      return pd.DataFrame({"flag": flag, "reason": reason})
+      103  
+      104  
+       99 -def rule_temperature(f, params):                              
+      105 +def rule_temperature(f, params, schedule):                    
+      106      r = cfg.RULES
+      107      spike = f["temp_resid"].abs() > r["spike_resid_degc"]
+      108      falling = (f["temp_dev"] < -params["heating_dev_degc"]) & 
+           (f["temp_rate_60"] < -params["heating_rate_degc_h"])
+     ...
+      114      )
+      115  
+      116  
+      111 -def rule_fridge(f, params):                                   
+      117 +def rule_fridge(f, params, schedule):                         
+      118      r = cfg.RULES
+      119      no_power = sustained(f[cfg.POWER] < r["power_loss_watts"],
+            r["power_loss_minutes"])
+      120      stuck = (f["fridge_mode"] == "running") & (f["fridge_mode_
+           minutes"] > r["stuck_on_minutes"])
+     ...
+      124      )
+      125  
+      126  
+      121 -def rule_motion(f, params):                                   
+      127 +def rule_motion(f, params, schedule):                         
+      128      r = cfg.RULES
+      123 -    away = in_window(f.index, cfg.SCHEDULE["away"]["window"], 
+          -cfg.SCHEDULE["away"]["days"])                                 
+     … 98 more lines (ctrl+o to expand)
+
+● Update(config.py)
+  ⎿  Added 5 lines
+      162      "away": {"days": [1, 2, 3], "window": (9 * 60, 17 * 60)}, 
+             # Tue-Thu 09:00-17:00
+      163      "night": {"window": (0, 5 * 60)},                         
+             # 00:00-05:00 every day
+      164  }
+      165 +# Sensitivity check only (not used for selection): wider windo
+          +ws that no longer match the injection windows                 
+      166 +SCHEDULE_SENSITIVITY = {                                      
+      167 +    "away": {"days": [1, 2, 3], "window": (8 * 60, 18 * 60 + 3
+          +0)},  # Tue-Thu 08:00-18:30                                   
+      168 +    "night": {"window": (23 * 60 + 30, 6 * 60)},              
+          +    # 23:30-06:00 (wraps midnight)                            
+      169 +}                                                             
+      170  
+      171  # Fixed rule thresholds (physics / house rules / unlabelled-tr
+           ain valleys)
+      172  RULES = {
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python
+      detect_anomalies.py 2>&1 | sed -n '/Val per anomaly/,$p')
+  ⎿  Val per anomaly type (detected | median delay min):
+                                           detected
+       median_delay_min
+     … +46 lines (ctrl+o to expand)
+  ⎿  Updated outputs\val_comparison.csv (+3 -3)
+      1  model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,be
+         nign_fa,total_errors,median_delay_min (median over sensors),mode
+         l_size_kb,ms_per_minute,tuned_params,explainability
+      2  rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0004,3,rule name + thresho
+         ld (e.g. 'compressor running > 30 min')
+      3 -iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0182,4,"most extre
+        -me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        -')"                                                             
+      4 -iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0231,4,most extrem
+        -e feature vs train                                              
+      5 -charts,11/14,3,11,1.57,1,1,14,7.25,14.1,0.0064,8,chart + signal 
+        -+ side (e.g. 'CUSUM of temp_dev below -20')                     
+      3 +iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.017,4,"most extrem
+        +e feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%'
+        +)"                                                              
+      4 +iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0211,4,most extrem
+        +e feature vs train                                              
+      5 +charts,11/14,3,11,1.57,1,1,14,7.25,14.1,0.006,8,chart + signal +
+        + side (e.g. 'CUSUM of temp_dev below -20')                      
+  ⎿  Updated outputs\val_per_type.csv (+29 -29)
+       1 -model,sensor,anomaly_type,detected                             
+       2 -rules,temp_living_room,temp_spike,2/2                          
+       3 -rules,temp_living_room,heating_failure,2/2                     
+       4 -rules,power_fridge,fridge_power_loss,2/2                       
+       5 -rules,power_fridge,compressor_stuck_on,2/2                     
+       6 -rules,motion_hallway,intrusion_motion,2/2                      
+       7 -rules,door_front,door_open_night,2/2                           
+       8 -rules,door_front,door_left_open,2/2                            
+       9 -iforest,temp_living_room,temp_spike,0/2                        
+      10 -iforest,temp_living_room,heating_failure,2/2                   
+      11 -iforest,power_fridge,fridge_power_loss,2/2                     
+      12 -iforest,power_fridge,compressor_stuck_on,0/2                   
+      13 -iforest,motion_hallway,intrusion_motion,0/2                    
+      14 -iforest,door_front,door_open_night,0/2                         
+      15 -iforest,door_front,door_left_open,0/2                          
+      16 -iforest_v2,temp_living_room,temp_spike,2/2                     
+      17 -iforest_v2,temp_living_room,heating_failure,2/2                
+      18 -iforest_v2,power_fridge,fridge_power_loss,2/2                  
+      19 -iforest_v2,power_fridge,compressor_stuck_on,0/2                
+      20 -iforest_v2,motion_hallway,intrusion_motion,0/2                 
+      21 -iforest_v2,door_front,door_open_night,0/2                      
+      22 -iforest_v2,door_front,door_left_open,2/2                       
+      23 -charts,temp_living_room,temp_spike,2/2                         
+      24 -charts,temp_living_room,heating_failure,2/2                    
+      25 -charts,power_fridge,fridge_power_loss,2/2                      
+      26 -charts,power_fridge,compressor_stuck_on,2/2                    
+      27 -charts,motion_hallway,intrusion_motion,1/2                     
+      28 -charts,door_front,door_open_night,0/2                          
+      29 -charts,door_front,door_left_open,2/2                           
+       1 +model,sensor,anomaly_type,detected,median_delay_min            
+       2 +rules,temp_living_room,temp_spike,2/2,0.0                      
+       3 +rules,temp_living_room,heating_failure,2/2,59.0                
+       4 +rules,power_fridge,fridge_power_loss,2/2,9.0                   
+       5 +rules,power_fridge,compressor_stuck_on,2/2,26.0                
+       6 +rules,motion_hallway,intrusion_motion,2/2,2.0                  
+       7 +rules,door_front,door_open_night,2/2,0.0                       
+       8 +rules,door_front,door_left_open,2/2,10.0                       
+       9 +iforest,temp_living_room,temp_spike,0/2,                       
+      10 +iforest,temp_living_room,heating_failure,2/2,131.0             
+      11 +iforest,power_fridge,fridge_power_loss,2/2,95.0                
+     … 18 more lines (ctrl+o to expand)
+  ⎿  Created outputs\val_sensitivity.csv (+9 -0)
+      1 +model,sensor,anomalies,hits,misses,false_alarms,cross_sensor_fa,
+        +benign_fa,errors,median_delay_min                               
+      2 +rules (main schedule),temp_living_room,4,4,0,0,0,0,0,27.5       
+      3 +rules (main schedule),power_fridge,4,4,0,0,0,0,0,15.5           
+      4 +rules (main schedule),motion_hallway,2,2,0,0,0,0,0,2.0          
+      5 +rules (main schedule),door_front,4,4,0,0,0,0,0,5.0              
+      6 +rules (wide schedule),temp_living_room,4,4,0,0,0,0,0,27.5       
+      7 +rules (wide schedule),power_fridge,4,4,0,0,0,0,0,15.5           
+      8 +rules (wide schedule),motion_hallway,2,2,0,2,1,0,2,2.0          
+      9 +rules (wide schedule),door_front,4,4,0,0,0,0,0,5.0              
+  ⎿  … 1 more file changed (part of the diff is unavailable)
+  ⎿  (timeout 10m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Sensitivity run done: the wider schedule adds 2 motion false alarms (people
+  still home at 08:00 on Tue/Wed, before they leave). Now updating design.md.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 1 line
+      308  - **Only the rule baseline gets the schedule.** The ML models 
+           (Isolation Forest, and any later model) do **not**; they must 
+           learn context from hour and day type in the data. This is a de
+           liberate contrast between the two approaches.
+      309  - Option B (learning quiet hours from motion) was rejected: mo
+           tion alone cannot tell an empty house from a sleeping one, so 
+           night bathroom trips would trigger intrusion alerts.
+      310  - The 1 W and 30 min evidence is reproduced in `analysis.ipynb
+           ` section 5 (check 5.6).
+      311 +- **Circularity caveat (reviewer):** the configured schedule m
+          +atches the generator's injection windows (away Tue–Thu 09–17 ≈
+          + intrusion window; night 00–05 ≈ `door_open_night` 00:30–05:00
+          +), and `motion_15` ≥ 2 mirrors the generator's guarantee of ≥ 
+          +2 intrusion motion minutes. The same designer wrote both, so *
+          +*rule recall is an upper bound**. The ML models and charts get
+          + none of this. Checked with a schedule sensitivity run (see re
+          +sults).                                                       
+      312  
+      313  ### Isolation Forest
+      314  
+
+● Update(docs\design.md)
+  ⎿  Added 1 line, removed 1 line
+      364  
+      365  **Comparison table:** detection per sensor/type, false alarms 
+           (total, per day, cross-sensor, on benign events), median delay
+           , model size, **inference time per minute**, number of tuned p
+           arameters, explainability.
+      366  
+      367 -### Val results (first run, seed 42; `outputs/val_*.csv`)     
+      367 +### Val results (first run: rules vs IF v1 only; kept for hist
+          +ory, superseded below)                                        
+      368  
+      369  | Model | Detected | False alarms | Benign FA | Cross-sensor F
+           A | Total errors | Size | ms / minute | Tuned params |
+      370  |---|---|---|---|---|---|---|---|---|
+
+● Update(docs\design.md)
+  ⎿  Added 33 lines, removed 2 lines
+      392  - **IF v2 vs v1:** +4 detections (temp spikes 2/2, door left o
+           pen 2/2), same false alarms. Still misses stuck-on, intrusion 
+           and night door openings. Size nearly doubled (larger `max_samp
+           les`).
+      393  - **Charts per sensor:**
+      394    - Fridge: 4/4, 0 FA (EWMA 6; delay 10 min, faster than rules
+           ' 15.5).
+      395 -  - Temperature: 4/4, but 10 FA. 9 of them are `temp_resid` on
+          - the daily heat-up ramps (06:30–07:10, 17:25–18:15): rising te
+          -mperature keeps the residual positive for many minutes, which 
+          -the chart accumulates. Heating failures were caught after 26–2
+          -7 min, about the same as rules (no gain for the gradual drift)
+          -.                                                             
+      395 +  - Temperature: 4/4, but 10 FA. 9 of them are `temp_resid` on
+          + the daily heat-up ramps (06:30–07:10, 17:25–18:15): rising te
+          +mperature keeps the residual positive for many minutes, which 
+          +the chart accumulates. **Heating failure: charts ~27 min vs ru
+          +les ~59 min** (rules need 15 sustained minutes of both dev and
+          + rate conditions; the chart accumulates evidence from the firs
+          +t minutes).                                                   
+      396    - Motion: 1/2 at CUSUM 80; lower limits catch both but add 5
+           –63 FA. 1 FA on weekend guests.
+      397    - Door: left open 2/2, night openings 0/2. A 1–2 min night o
+           pening adds too little to the chart before it ends; limits tha
+           t catch it add 3–19 FA.
+      398 -- **Selected: rules** (still fewest total val errors). Same ci
+          -rcularity caveat as before.                                   
+      398 +- **Selected: rules** (still fewest total val errors), subject
+          + to the circularity caveat (rule recall is an upper bound).   
+      399  
+      400 +**Median detection delay per anomaly type (min; `outputs/val_p
+          +er_type.csv`)**                                               
+      401 +                                                              
+      402 +| Anomaly type | Rules | Charts | IF v2 | IF v1 |             
+      403 +|---|---|---|---|---|                                         
+      404 +| temp_spike | 0 | 0 | 0 | – |                                
+      405 +| heating_failure | 59 | **26.5** | 86.5 | 131 |              
+      406 +| fridge_power_loss | 9 | **4.5** | 91 | 95 |                 
+      407 +| compressor_stuck_on | 26 | **19** | – | – |                 
+      408 +| intrusion_motion | **2** | 3 (1/2) | – | – |                
+      409 +| door_open_night | **0** | – | – | – |                       
+      410 +| door_left_open | 10 | 4.5 | **3.5** | – |                   
+      411 +                                                              
+      412 +– = not detected. Per-sensor medians mix types (e.g. rules tem
+          +p 27.5 = spikes 0 + failures 59), so per-type delay is the num
+          +ber to read.                                                  
+      413 +                                                              
+      414 +**Schedule sensitivity (rules only; not used for selection; `o
+          +utputs/val_sensitivity.csv`)**                                
+      415 +Only the schedule changes: away Tue–Thu 08:00–18:30, night 23:
+          +30–06:00 (`config.SCHEDULE_SENSITIVITY`); same grid and tuning
+          + (chose the same d, r, D).                                    
+      416 +                                                              
+      417 +| Schedule | Detected | False alarms | Total errors |         
+      418 +|---|---|---|---|                                             
+      419 +| Main (matches injection windows) | 14/14 | 0 | 0 |          
+      420 +| Wide | 14/14 | 2 (motion; 1 cross-sensor) | 2 |             
+      421 +                                                              
+      422 +- Both new FAs are 08:00 on Tue/Wed: adults are still home bef
+          +ore leaving (08:00–08:45) and the last door opening was the ev
+          +ening before, so the door link does not suppress them. No new 
+          +door FAs from the wider night window on val.                  
+      423 +- Reading: rules stay best on val (2 errors vs 9 for IF v2), b
+          +ut their 0 errors depends on a schedule that fits the househol
+          +d exactly. In a real home the schedule is user-entered and dri
+          +fts; this is a deployment risk to state in the README.        
+      424 +                                                              
+      425 +### Stage 5 implementation notes and corrections              
+      426 +- **Code:** all four models live in `detect_anomalies.py` (sec
+          +tions 2a rules, 2b IF v1/v2, 2c charts), share the alert/scori
+          +ng/tuning code, and save `artifacts/candidate_<model>.joblib`;
+          + the selected one is copied to `selected_model.joblib` (+ `.js
+          +on`). Tie order for selection: rules → charts → IF v2 → IF v1 
+          +(simpler first).                                              
+      427 +- **Bug fixed before reporting:** CUSUM did not restart after 
+          +a signal; after the 01‑26 heating failure the lower sum stayed
+          + above the limit for 2.5 days, giving one alert that covered b
+          +oth failures and hid false alarms. Fixed (restart at 0 after a
+          + signal).                                                     
+      428 +- **Reviewer fixes:** (1) circularity caveat written down + sc
+          +hedule sensitivity run; (2) delay now reported per anomaly typ
+          +e. My first chart summary wrongly said heating-failure delay w
+          +as "about the same as rules"; per-type delays show charts ~27 
+          +min vs rules ~59 min.                                         
+      429 +- **Not iterated further (by decision):** IF v2 is the single 
+          +fair revision; chart signals/constants were not re-tuned after
+          + seeing val (e.g. the heat-up `temp_resid` false alarms are re
+          +ported, not fixed).                                           
+      430 +                                                              
+      431  ---
+      432  
+      433  ## README Carry-Over
+
+● Update(docs\design.md)
+  ⎿  Added 4 lines
+      464    - Show briefly as evidence that no labels were used.
+      465  - **Explainability extension:** IF alerts currently report the
+            most extreme feature vs train. Future work: SHAP values (e.g.
+            `shap.TreeExplainer` on each IF) for per-feature contribution
+           s.
+      466  - **Schedule vs learned context:** the rule baseline uses a us
+           er-configured away/night schedule; the ML models get no schedu
+           le and learn context from the data.
+      467 +- **Circularity caveat (must be stated):** the rule schedule m
+          +atches the injection windows, so rule recall is an upper bound
+          +. Show the schedule sensitivity result (wide schedule: 14/14, 
+          +2 FA vs 0) and that a user-entered schedule is a deployment ri
+          +sk.                                                           
+      468 +- **Model comparison (Stage 5):** rules, IF v1, IF v2 (fewer s
+          +ensor-specific inputs + learned activity rates), EWMA/CUSUM co
+          +ntrol charts. Show the val comparison table and the per-type d
+          +elay table. Key points: charts are fastest on gradual/sustaine
+          +d anomalies (heating failure ~27 vs ~59 min, power loss, stuck
+          +-on) but false-alarm on heat-up ramps and miss short night doo
+          +r openings; IF improves with focused inputs but still misses d
+          +uration/context anomalies; only rules catch the context-depend
+          +ent ones, helped by the schedule.                             
+      469 +- **Process notes for Stage 5:** CUSUM restart bug found and f
+          +ixed before reporting; reviewer caught a misreported delay (pe
+          +r-sensor median hid per-type differences), so delays are now r
+          +eported per type.                                             
+      470 +- **Possible extension:** a hybrid (charts for fridge/heating 
+          +drift, rules for context-dependent door/motion) — not built.  
+      471  - **Heating failure is contextual:** normal setback cooling (~
+           0.6 °C/h at its start) overlaps the slowest failures. The rate
+            of fall alone is not enough; the detector needs the context (
+           target 21 °C, awake and home).
+      472  - **Productionization:** on-device serving. Cloud is used for 
+           retraining and model updates. Monitoring and retraining strate
+           gy still to be written.
+      473  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+
+● I've made both reviewer fixes and rerun everything on val (test still
+  untouched). The rules remain the selected model.
+
+  Results on val
+
+  ┌───────────┬──────────┬──────────────────┬──────────┬───────┬───────────┐
+  │   Model   │ Detected │   False alarms   │  Total   │ Size  │ Time per  │
+  │           │          │                  │  errors  │       │  minute   │
+  ├───────────┼──────────┼──────────────────┼──────────┼───────┼───────────┤
+  │ Rules     │ 14/14    │ 0                │ 0        │ 3 KB  │ 0.0004 ms │
+  ├───────────┼──────────┼──────────────────┼──────────┼───────┼───────────┤
+  │ IF v2     │ 8/14     │ 3 (2 on weekend  │ 9        │ 20.9  │ 0.023 ms  │
+  │           │          │ guests)          │          │ MB    │           │
+  ├───────────┼──────────┼──────────────────┼──────────┼───────┼───────────┤
+  │ IF v1     │ 4/14     │ 3 (2 on weekend  │ 13       │ 11.5  │ 0.018 ms  │
+  │           │          │ guests)          │          │ MB    │           │
+  ├───────────┼──────────┼──────────────────┼──────────┼───────┼───────────┤
+  │ Control   │ 11/14    │ 11 (1            │ 14       │ 14 KB │ 0.006 ms  │
+  │ charts    │          │ cross-sensor)    │          │       │           │
+  └───────────┴──────────┴──────────────────┴──────────┴───────┴───────────┘
+
+  (IF = Isolation Forest.) Tuned settings:
+  - Rules: d = 0.5 °C, r = 0.2 °C/h, D = 60 min.
+  - IF v2: thresholds at p99.95 for temperature and motion, p99.5 for fridge and
+    door.
+  - Control charts: EWMA limit 8 for temperature, EWMA limit 6 for fridge, CUSUM
+    limit 80 for motion and door.
+
+  Median detection delay by anomaly type (minutes; – = not detected)
+
+  ┌─────────────────────┬───────┬───────────────────┬───────┬───────┐
+  │    Anomaly type     │ Rules │      Charts       │ IF v2 │ IF v1 │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Temperature spike   │ 0     │ 0                 │ 0     │ –     │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Heating failure     │ 59    │ 26.5              │ 86.5  │ 131   │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Fridge power loss   │ 9     │ 4.5               │ 91    │ 95    │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Compressor stuck on │ 26    │ 19                │ –     │ –     │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Intrusion           │ 2     │ 3 (caught 1 of 2) │ –     │ –     │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Door open at night  │ 0     │ –                 │ –     │ –     │
+  ├─────────────────────┼───────┼───────────────────┼───────┼───────┤
+  │ Door left open      │ 10    │ 4.5               │ 3.5   │ –     │
+  └─────────────────────┴───────┴───────────────────┴───────┴───────┘
+
+  What the results show
+
+  - Control charts are fastest on gradual or sustained anomalies. On heating
+    failure they take about 27 min against 59 for the rules, which corrects what
+    I told you last time ("about the same"). The rules' per-sensor median of
+    27.5 min hid this by mixing spikes with failures.
+  - Control charts have two weaknesses. Nine of their 10 temperature false
+    alarms come from the daily heat-up periods. They also miss 1–2 min night
+    door openings.
+  - IF v2 improves on v1 but still misses duration- and context-based anomalies
+    (compressor stuck on, intrusion, night openings).
+  - Only the rules catch the context-dependent anomalies. That is largely
+    because they get the configured schedule, which matches the windows the
+    generator used to inject anomalies.
+
+  Schedule sensitivity check
+
+  I widened only the rules' schedule (away Tue–Thu 08:00–18:30, night
+  23:30–06:00) and retuned with the same grid.
+
+  ┌─────────────────────────────────┬──────────┬─────────────┬─────────────┐
+  │            Schedule             │ Detected │   False     │   Total     │
+  │                                 │          │   alarms    │   errors    │
+  ├─────────────────────────────────┼──────────┼─────────────┼─────────────┤
+  │ Main (matches injection         │ 14/14    │ 0           │ 0           │
+  │ windows)                        │          │             │             │
+  ├─────────────────────────────────┼──────────┼─────────────┼─────────────┤
+  │ Wide                            │ 14/14    │ 2           │ 2           │
+  └─────────────────────────────────┴──────────┴─────────────┴─────────────┘
+
+  - Where the 2 false alarms come from: both are motion at 08:00 on Tue/Wed,
+    when people are still home before leaving. The door hadn't opened since the
+    evening before, so the door check doesn't cancel them.
+  - What this means: the rules still beat IF v2 (2 errors against 9), but their
+    perfect score depends on a schedule that fits the household exactly. A real
+    user-entered schedule would drift. The README will say that rule recall is
+    an upper bound.
+
+  Is it all documented in design.md?
+
+  Yes. Stage 5 now covers:
+  - Each model's design: rules, IF v1, IF v2, and control charts (signals, what
+    is fit on train, fixed constants, grids).
+  - The circularity caveat.
+  - All results tables: the comparison, per-type delays, and the sensitivity
+    check.
+  - A new "Stage 5 implementation notes and corrections" list: the CUSUM restart
+    bug, both reviewer fixes including my wrong delay claim, and that we
+    stopped improving the models after IF v2 by decision.
+
+  The README carry-over section has all of this too, plus a possible hybrid
+  extension (charts for fridge and heating, rules for door and motion), which is
+  not built. The first rules-vs-IF results are kept and marked as superseded.
+
+  Still open:
+  - requirements.txt still lists only numpy and pandas. It needs scikit-learn,
+    matplotlib, joblib, nbconvert and ipykernel; I'll add them when you say.
+  - None of the Stage 4/5 work is committed yet.
+  - Please /export the Stage 5 transcript into ai_transcripts/ before we move to
+    Stage 6.
+  - My recommendation for Stage 6 is still to report all four models on the one
+    test run.
+
+✻ Cooked for 1m 58s · done 6:35 PM
+
+※ recap: We're building the smart-home anomaly detection take-home, and Stage 5 (model comparison) is finished: rules remain the selected model, with the circularity caveat now documented. Next, please /export the transcript into ai_transcripts/, then we start Stage 6 evaluation.
+
+❯ the temperature chart has 10 false alarms. Which signal triggerd them and at  
+  what time of the day?                                                         
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Nine of the 10 false alarms come from the temp_resid signal, the reading minus
+  its 15-minute rolling median. All nine fall in the two daily heat-up periods,
+  when the thermostat switches back to 21 °C.
+
+  ┌────────┬──────────────┬─────────────┬───────────────────────────────────┐
+  │  Day   │    Alert     │   Signal    │              Period               │
+  │        │  start–end   │             │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Mon    │ 06:44–06:52  │ temp_resid  │ Morning heat-up                   │
+  │ 01‑22  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Tue    │              │ temp_resid  │ Morning heat-up (also overlaps a  │
+  │ 01‑23  │ 06:40–06:48  │ high        │ fridge power loss, so it counts   │
+  │        │              │             │ as cross-sensor)                  │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Tue    │ 17:25–17:32  │ temp_resid  │ Evening heat-up                   │
+  │ 01‑23  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Wed    │ 07:05–07:18  │ temp_dev    │ Morning                           │
+  │ 01‑24  │              │ low         │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Wed    │ 17:57–18:07  │ temp_resid  │ Evening heat-up                   │
+  │ 01‑24  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Thu    │ 06:45–06:46  │ temp_resid  │ Morning heat-up                   │
+  │ 01‑25  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Thu    │ 17:58–18:13  │ temp_resid  │ Evening heat-up                   │
+  │ 01‑25  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Fri    │ 06:53–06:57  │ temp_resid  │ Morning heat-up                   │
+  │ 01‑26  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Sat    │ 07:02–07:09  │ temp_resid  │ Morning heat-up                   │
+  │ 01‑27  │              │ high        │                                   │
+  ├────────┼──────────────┼─────────────┼───────────────────────────────────┤
+  │ Sun    │ 06:30–06:37  │ temp_resid  │ Morning heat-up                   │
+  │ 01‑28  │              │ high        │                                   │
+  └────────┴──────────────┴─────────────┴───────────────────────────────────┘
+
+  Why this happens:
+  - Morning and evening heat-up (9 alarms): while the room warms by about 3 °C,
+    each reading sits above its own lagging 15-minute median. The residual stays
+    around +0.3 to +0.5 °C for many minutes in a row, against a normal spread
+    of about 0.07 °C. The control chart adds up evidence over time, so a long
+    run of small positive residuals crosses the limit just as a spike does. The
+    fixed spike rule doesn't fire because it looks at one minute at a time, and
+    these residuals never reach 1.5 °C.
+  - Wednesday morning (1 alarm): the temperature was more than 8σ below the
+    usual value for 07:00 on a Tue–Thu morning. Most likely the heat-up started
+    later than usual that day (wake-up time varies by up to ±30 min). I haven't
+    checked this against the generation log yet.
+
+  What it means: the problem lies in which signal the chart watches, not in the
+  chart method. One possible fix is to stop feeding temp_resid into the chart
+  and catch spikes with a single-minute limit instead. But we agreed not to keep
+  tuning after seeing val results, so I've recorded it rather than changed it.
+  design.md already describes the heat-up cause.
+
+✻ Cogitated for 19s · done 6:53 PM
+
+※ recap: We're building the smart-home anomaly detection take-home, and Stage 5 (model comparison) is done, with the rules selected and everything documented in design.md. Next, export the transcript and confirm Stage 6 reports all four models on the test run.
+
+❯ yes stop feeding temp_resid and keep teemp_dev lower side only; also thisnt   
+  tuning based ob val; spikes are rule based job; we are measureing shifts      
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+     Tuned charts: {'temp_living_room': ('ewma', 6), 'power_fridge': ('ewma
+     ', 6), 'motion_hallway': ('cusum', 80), 'door_front': ('cusum', 80)}
+     … +89 lines (ctrl+o to expand)
+  ⎿  Updated detect_anomalies.py (+2 -2)
+      240  # (column, side, standardisation): None = one global median/MA
+           D, list = median/MAD per group,
+      241  # "rate" = binary signal standardised by its learned per-(day_
+           type, hour) rate
+      242  CHART_STREAMS = {
+      243 -    cfg.TEMP: [("temp_resid", "both", None), ("temp_dev", "low
+          -er", ["baseline_group", "hour"])],                            
+      243 +    cfg.TEMP: [("temp_dev", "lower", ["baseline_group", "hour"
+          +])],   # shifts only; spikes are a rule's job                 
+      244      cfg.POWER: [(cfg.POWER, "both", ["fridge_mode"]), ("fridge
+           _mode_minutes", "upper", ["fridge_mode"])],
+      245      cfg.MOTION: [(cfg.MOTION, "upper", "rate")],
+      246      cfg.DOOR: [(cfg.DOOR, "upper", "rate")],
+      247  }
+      248 -SCALE_FLOOR = {"temp_resid": 0.05, "temp_dev": 0.1, cfg.POWER:
+          - 0.5, "fridge_mode_minutes": 1.0}                             
+      248 +SCALE_FLOOR = {"temp_dev": 0.1, cfg.POWER: 0.5, "fridge_mode_m
+          +inutes": 1.0}                                                 
+      249  
+      250  
+      251  def robust_center_scale(x):
+  ⎿  Updated outputs\alerts_charts_val.csv (+3 -14)
+       1  sensor,model,start,end,reason
+       2 -temp_living_room,charts,2024-01-22 06:44:00,2024-01-22 06:52:00
+         -,EWMA of temp_resid above +8 sigma                             
+       2  power_fridge,charts,2024-01-22 18:13:00,2024-01-22 19:58:00,EWM
+          A of power_fridge below -6 sigma
+       3  power_fridge,charts,2024-01-23 01:07:00,2024-01-23 01:48:00,EWM
+          A of fridge_mode_minutes above +6 sigma
+       4  power_fridge,charts,2024-01-23 06:11:00,2024-01-23 08:36:00,EWM
+          A of power_fridge below -6 sigma
+       6 -temp_living_room,charts,2024-01-23 06:40:00,2024-01-23 06:48:00
+         -,EWMA of temp_resid above +8 sigma                             
+       7 -temp_living_room,charts,2024-01-23 17:25:00,2024-01-23 17:32:00
+         -,EWMA of temp_resid above +8 sigma                             
+       8 -temp_living_room,charts,2024-01-24 07:05:00,2024-01-24 07:18:00
+         -,EWMA of temp_dev below -8 sigma                               
+       9 -temp_living_room,charts,2024-01-24 17:57:00,2024-01-24 18:07:00
+         -,EWMA of temp_resid above +8 sigma                             
+       5 +temp_living_room,charts,2024-01-24 07:03:00,2024-01-24 07:21:00
+         +,EWMA of temp_dev below -6 sigma                               
+       6  door_front,charts,2024-01-24 20:56:00,2024-01-24 20:56:00,CUSUM
+           of door_front above +80 (CUSUM h)
+       7  door_front,charts,2024-01-24 21:17:00,2024-01-24 21:17:00,CUSUM
+           of door_front above +80 (CUSUM h)
+      12 -temp_living_room,charts,2024-01-25 05:46:00,2024-01-25 05:52:00
+         -,EWMA of temp_resid above +8 sigma                             
+      13 -temp_living_room,charts,2024-01-25 06:45:00,2024-01-25 06:46:00
+         -,EWMA of temp_resid above +8 sigma                             
+       8  motion_hallway,charts,2024-01-25 16:56:00,2024-01-25 16:56:00,C
+          USUM of motion_hallway above +80 (CUSUM h)
+      15 -temp_living_room,charts,2024-01-25 17:58:00,2024-01-25 18:13:00
+         -,EWMA of temp_resid above +8 sigma                             
+      16 -temp_living_room,charts,2024-01-26 05:48:00,2024-01-26 05:53:00
+         -,EWMA of temp_resid above +8 sigma                             
+      17 -temp_living_room,charts,2024-01-26 06:53:00,2024-01-26 06:57:00
+         -,EWMA of temp_resid above +8 sigma                             
+      18 -temp_living_room,charts,2024-01-26 10:43:00,2024-01-26 14:30:00
+         -,EWMA of temp_dev below -8 sigma                               
+       9 +temp_living_room,charts,2024-01-26 10:39:00,2024-01-26 14:35:00
+         +,EWMA of temp_dev below -6 sigma                               
+      10  power_fridge,charts,2024-01-27 05:13:00,2024-01-27 06:09:00,EWM
+          A of fridge_mode_minutes above +6 sigma
+      20 -temp_living_room,charts,2024-01-27 07:02:00,2024-01-27 07:09:00
+         -,EWMA of temp_resid above +8 sigma                             
+      11  motion_hallway,charts,2024-01-27 23:05:00,2024-01-27 23:05:00,C
+          USUM of motion_hallway above +80 (CUSUM h)
+      22 -temp_living_room,charts,2024-01-28 06:30:00,2024-01-28 06:37:00
+         -,EWMA of temp_resid above +8 sigma                             
+      23 -temp_living_room,charts,2024-01-28 08:24:00,2024-01-28 12:10:00
+         -,EWMA of temp_dev below -8 sigma                               
+      12 +temp_living_room,charts,2024-01-28 08:17:00,2024-01-28 12:23:00
+         +,EWMA of temp_dev below -6 sigma                               
+      13  door_front,charts,2024-01-28 19:59:00,2024-01-28 19:59:00,CUSUM
+           of door_front above +80 (CUSUM h)
+      14  door_front,charts,2024-01-28 20:11:00,2024-01-28 20:11:00,CUSUM
+           of door_front above +80 (CUSUM h)
+      15  door_front,charts,2024-01-28 20:23:00,2024-01-28 20:23:00,CUSUM
+           of door_front above +80 (CUSUM h)
+  ⎿  Updated outputs\val_chart_reactions.csv (+2 -2)
+      5  motion_hallway,ewma 8,2,0,8,8,1.5
+      6  power_fridge,cusum 80,4,0,1,1,35.5
+      7  power_fridge,ewma 6,4,0,0,0,10.0
+      8 -temp_living_room,cusum 80,2,2,11,13,40.0                        
+      9 -temp_living_room,ewma 8,4,0,10,10,13.0                          
+      8 +temp_living_room,cusum 80,2,2,1,3,40.0                          
+      9 +temp_living_room,ewma 6,2,2,1,3,21.0                            
+  ⎿  Updated outputs\val_comparison.csv (+3 -3)
+      1  model,detected,misses,false_alarms,fa_per_day,cross_sensor_fa,be
+         nign_fa,total_errors,median_delay_min (median over sensors),mode
+         l_size_kb,ms_per_minute,tuned_params,explainability
+      2  rules,14/14,0,0,0.0,0,0,0,10.25,3.2,0.0004,3,rule name + thresho
+         ld (e.g. 'compressor running > 30 min')
+      3 -iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.017,4,"most extrem
+        -e feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%'
+        -)"                                                              
+      4 -iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0211,4,most extrem
+        -e feature vs train                                              
+      5 -charts,11/14,3,11,1.57,1,1,14,7.25,14.1,0.006,8,chart + signal +
+        - side (e.g. 'CUSUM of temp_dev below -20')                      
+      3 +iforest,4/14,10,3,0.43,0,2,13,113.0,11482.3,0.0189,4,"most extre
+        +me feature vs train (e.g. 'fridge_mode_minutes = 85, above 99.9%
+        +')"                                                             
+      4 +iforest_v2,8/14,6,3,0.43,0,2,9,42.0,20863.7,0.0227,4,most extrem
+        +e feature vs train                                              
+      5 +charts,9/14,5,2,0.29,0,1,7,7.25,14.0,0.0056,8,chart + signal + s
+        +ide (e.g. 'CUSUM of temp_dev below -20')                        
+  ⎿  Updated outputs\val_per_sensor.csv (+1 -1)
+      11  iforest_v2,power_fridge,4,2,2,0,0,0,2,91.0
+      12  iforest_v2,motion_hallway,2,0,2,2,0,2,4,
+      13  iforest_v2,door_front,4,2,2,0,0,0,2,3.5
+      14 -charts,temp_living_room,4,4,0,10,1,0,10,13.0                   
+      14 +charts,temp_living_room,4,2,2,1,0,0,3,21.0                     
+      15  charts,power_fridge,4,4,0,0,0,0,0,10.0
+      16  charts,motion_hallway,2,1,1,1,0,1,2,3.0
+      17  charts,door_front,4,2,2,0,0,0,2,4.5
+  ⎿  … 4 more files changed (part of the diff is unavailable)
+  ⎿  (timeout 10m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Updating design.md with the new chart signal and results.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+● The temperature chart now watches only temp_dev, on the low side, and its
+  false alarms dropped from 10 to 1.
+
+  Control charts on val, before and after:
+
+  ┌────────────────────────────────┬────────────┬──────────────────────────┐
+  │                                │   Before   │          After           │
+  ├────────────────────────────────┼────────────┼──────────────────────────┤
+  │ Temperature: detected / false  │ 4/4 / 10   │ 2/4 / 1                  │
+  │ alarms                         │            │                          │
+  ├────────────────────────────────┼────────────┼──────────────────────────┤
+  │ Heating failure delay          │ 26.5 min   │ 21 min (rules: 59)       │
+  ├────────────────────────────────┼────────────┼──────────────────────────┤
+  │ Spikes                         │ 2/2        │ 0/2 (spike detection is  │
+  │                                │            │ left to the rules)       │
+  ├────────────────────────────────┼────────────┼──────────────────────────┤
+  │ All sensors: detected / false  │ 11/14 / 11 │ 9/14 / 2 / 7             │
+  │ alarms / total errors          │  / 14      │                          │
+  └────────────────────────────────┴────────────┴──────────────────────────┘
+
+  - The remaining false alarm is Wed 01‑24 07:03–07:21, from temp_dev low: the
+    room was colder than usual for a Tue–Thu 07:00. That's most likely a heat-up
+    that started late.
+  - New ranking: Rules 0 errors, Charts 7, IF v2 9, IF v1 13. The control charts
+    are now second.
+  - Selected model: still the rules, with the circularity caveat.
+  - Other sensors: nothing changed for fridge, motion or door, so their numbers
+    are as before.
+
+  design.md now records this as a design correction, not tuning on val: control
+  charts measure sustained shifts, and spikes belong to a single-minute rule. It
+  has the before/after effect, the updated results and per-type delay tables,
+  and the new note in the README carry-over section. The λ, k, scale floors and
+  grids are unchanged.
+
+  Still open from before: update requirements.txt, commit (only if you ask), and
+  run /export before Stage 6.
+
+✻ Churned for 43s · done 7:06 PM
+
+※ recap: We're building the smart-home anomaly detection take-home and just finished comparing four models on validation, where the rules still win and the control charts now come second. Next, export the transcript into ai_transcripts and start Stage 6, evaluation and selection.
+
+❯ update requirements.txt                                                       
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(requirements.txt)
+  ⎿  Added 9 lines
+       1 +# Core (generate_data.py, features.py, detect_anomalies.py)    
+       2  numpy==2.5.4
+       3  pandas==3.1.0
+       4 +scikit-learn==1.9.1                                            
+       5 +joblib==1.6.0                                                  
+       6 +                                                               
+       7 +# Notebook (analysis.ipynb: plots + headless execution via nbco
+         +nvert)                                                         
+       8 +matplotlib==3.11.2                                             
+       9 +nbconvert==7.17.2                                              
+      10 +nbclient==0.11.0                                               
+      11 +ipykernel==7.4.0                                               
+
+● I updated requirements.txt to pin every package the project uses, at the
+  versions installed in .venv. I didn't test a fresh pip install from it.
+
+  # Core (generate_data.py, features.py, detect_anomalies.py)
+  numpy==2.5.4
+  pandas==3.1.0
+  scikit-learn==1.9.1
+  joblib==1.6.0
+
+  # Notebook (analysis.ipynb: plots + headless execution via nbconvert)
+  matplotlib==3.11.2
+  nbconvert==7.17.2
+  nbclient==0.11.0
+  ipykernel==7.4.0
+
+  scipy is left out because scikit-learn installs it. I also left out notebook,
+  since installing it failed on Python 3.15. The README can say to run the
+  notebook with jupyter nbconvert --execute, or open it in VS Code.
+
+  Still open: committing the Stage 4/5 work (only if you ask), and running
+  /export before Stage 6.
+
+✻ Brewed for 12s · done 7:10 PM
+❯ also explain in the design above all the artifcats, files and ouputs on why   
+  is ity being generated after the model comparsion                             
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(docs\design.md)
+  ⎿  Added 30 lines
+      422  - Both new FAs are 08:00 on Tue/Wed: adults are still home bef
+           ore leaving (08:00–08:45) and the last door opening was the ev
+           ening before, so the door link does not suppress them. No new 
+           door FAs from the wider night window on val.
+      423  - Reading: rules stay best on val (2 errors vs 7 for charts), 
+           but their 0 errors depends on a schedule that fits the househo
+           ld exactly. In a real home the schedule is user-entered and dr
+           ifts; this is a deployment risk to state in the README.
+      424  
+      425 +### Files produced by `detect_anomalies.py` (and why)         
+      426 +One run writes everything below; all are reproducible from the
+          + seed. Test is never loaded, so every file here is train-fit /
+          + val-scored only.                                             
+      427 +                                                              
+      428 +**`artifacts/` – fitted models (what the next stages load)**  
+      429 +                                                              
+      430 +| File | Contents | Why it exists |                           
+      431 +|---|---|---|                                                 
+      432 +| `candidate_rules.joblib` (3 KB) | Tuned d, r, D; fixed thres
+          +holds; schedule; temperature baseline | Keeps every candidate 
+          +frozen exactly as tuned on val, so the Stage 6 test run can sc
+          +ore all four without refitting (no chance to refit on val/test
+          +) |                                                           
+      433 +| `candidate_iforest.joblib` (11.5 MB) | 4 forests (v1 inputs)
+          +, train score percentiles, chosen thresholds, explanation quan
+          +tiles, baseline, activity rates | Same; size is also the "mode
+          +l size" column in the comparison |                            
+      434 +| `candidate_iforest_v2.joblib` (20.9 MB) | Same for v2 inputs
+          + | Same |                                                     
+      435 +| `candidate_charts.joblib` (14 KB) | Train centres/scales per
+          + signal, activity rates, λ / k, chosen chart + limit per senso
+          +r | Same |                                                    
+      436 +| `selected_model.joblib` | Copy of the winning candidate (cur
+          +rently rules) | The single model `inference.py` loads for the 
+          +production test (stream days 22–28 once) |                    
+      437 +| `selected_model.json` | Model name + tuned settings in plain
+          + text | Human-readable record of what was selected, without lo
+          +ading Python objects |                                        
+      438 +                                                              
+      439 +Artifacts are plain dicts of sklearn / pandas / numpy objects 
+          +(no custom classes), so they load without importing `detect_an
+          +omalies.py`'s internals.                                      
+      440 +                                                              
+      441 +**`outputs/` – val evidence for the comparison (what the desig
+          +n doc and README cite)**                                      
+      442 +                                                              
+      443 +| File | Contents | Why it exists |                           
+      444 +|---|---|---|                                                 
+      445 +| `alerts_<model>_val.csv` (×4) | One row per alert: sensor, m
+          +odel, start, end, reason | The task's "detected anomalies" out
+          +put; lets a reviewer check each alert and its explanation agai
+          +nst `anomaly_labels.csv` |                                    
+      446 +| `val_comparison.csv` | One row per model: detected, misses, 
+          +FA (total, per day, cross-sensor, benign), total errors, media
+          +n delay, size, ms/minute, tuned params, explainability | The s
+          +election table (one model by total errors) |                  
+      447 +| `val_per_sensor.csv` | Same metrics per model × sensor | Per
+          +-sensor reporting required by the selection rule |            
+      448 +| `val_per_type.csv` | Detected and median delay per model × a
+          +nomaly type | Per-type recall and delay (reviewer fix: per-sen
+          +sor medians hid per-type differences) |                       
+      449 +| `val_tuning_log.csv` | Every grid setting tried, per model ×
+          + sensor, with hits / misses / FA / errors / delay | Transparen
+          +cy of tuning: shows how sensitive each choice is (e.g. IF door
+          + p99.0 = 24 FA) |                                             
+      450 +| `val_chart_reactions.csv` | Best EWMA vs best CUSUM setting 
+          +per sensor | Answers "how does each sensor react to each chart
+          +" |                                                           
+      451 +| `val_sensitivity.csv` | Rules per sensor with the main vs th
+          +e wide schedule | Quantifies the circularity caveat (reviewer 
+          +fix); not used for selection |                                
+      452 +                                                              
+      453 +`outputs/eda/` (Stage 4 plots) is written by `analysis.ipynb`,
+          + not by this script.                                          
+      454 +                                                              
+      455  ### Stage 5 implementation notes and corrections
+      456  - **Code:** all four models live in `detect_anomalies.py` (sec
+           tions 2a rules, 2b IF v1/v2, 2c charts), share the alert/scori
+           ng/tuning code, and save `artifacts/candidate_<model>.joblib`;
+            the selected one is copied to `selected_model.joblib` (+ `.js
+           on`). Tie order for selection: rules → charts → IF v2 → IF v1 
+           (simpler first).
+      457  - **Bug fixed before reporting:** CUSUM did not restart after 
+           a signal; after the 01‑26 heating failure the lower sum stayed
+            above the limit for 2.5 days, giving one alert that covered b
+           oth failures and hid false alarms. Fixed (restart at 0 after a
+            signal).
+
+● I added a section to design.md Stage 5, just before the implementation notes:
+  "Files produced by detect_anomalies.py (and why)". It has two tables:
+
+  - artifacts/: the six model files. Each of the four candidates is saved frozen
+    exactly as tuned on val, so the Stage 6 test run can score them all without
+    refitting. selected_model.joblib is the one inference.py will load for the
+    production stream. selected_model.json is a readable record of which model
+    won and its settings.
+  - outputs/: the ten evidence files. They cover the four alert CSVs (the task's
+    "detected anomalies" output) and the comparison and per-sensor tables used
+    for selection. They also include the per-type table (from the reviewer fix),
+    the full tuning log, the EWMA vs CUSUM best settings per sensor, and the
+    schedule sensitivity check.
+
+  It also notes that outputs/eda/ comes from the notebook, not from this script.
+
+  Decision for you: the two Isolation Forest files are large, 11.5 MB and 20.9
+  MB. If we commit artifacts/, they'll bloat the repo. My suggestion is to
+  commit only candidate_rules, candidate_charts, selected_model.* and outputs/,
+  and gitignore the Isolation Forest files, since they can be rebuilt by running
+  detect_anomalies.py in about 40 s. Should I set that up when you ask me to
+  commit?
+
+✻ Cooked for 23s · done 7:14 PM
+
+❯ Lets ignore the artifcats folder as it waas only not asked and can be         
+  rebuilt...remove them ffrom the deisgn.md file for indiv expalonations        
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && printf 'artifacts/\n'
+      >> .gitignore && cat .gitignore && .venv/Scripts/python - <<'EOF'
+      from pathlib import Pa…)
+  ⎿  .venv/
+     __pycache__/
+     .ipynb_checkpoints/
+     … +23 lines (ctrl+o to expand)
+  ⎿  Updated .gitignore (+1 -0)
+      1  .venv/
+      2  __pycache__/
+      3  .ipynb_checkpoints/
+      4 +artifacts/                                                      
+  ⎿  Updated docs\design.md (+1 -12)
+      425  ### Files produced by `detect_anomalies.py` (and why)
+      426  One run writes everything below; all are reproducible from the
+            seed. Test is never loaded, so every file here is train-fit /
+            val-scored only.
+      427  
+      428 -**`artifacts/` – fitted models (what the next stages load)**  
+      429 -                                                              
+      430 -| File | Contents | Why it exists |                           
+      431 -|---|---|---|                                                 
+      432 -| `candidate_rules.joblib` (3 KB) | Tuned d, r, D; fixed thres
+          -holds; schedule; temperature baseline | Keeps every candidate 
+          -frozen exactly as tuned on val, so the Stage 6 test run can sc
+          -ore all four without refitting (no chance to refit on val/test
+          -) |                                                           
+      433 -| `candidate_iforest.joblib` (11.5 MB) | 4 forests (v1 inputs)
+          -, train score percentiles, chosen thresholds, explanation quan
+          -tiles, baseline, activity rates | Same; size is also the "mode
+          -l size" column in the comparison |                            
+      434 -| `candidate_iforest_v2.joblib` (20.9 MB) | Same for v2 inputs
+          - | Same |                                                     
+      435 -| `candidate_charts.joblib` (14 KB) | Train centres/scales per
+          - signal, activity rates, λ / k, chosen chart + limit per senso
+          -r | Same |                                                    
+      436 -| `selected_model.joblib` | Copy of the winning candidate (cur
+          -rently rules) | The single model `inference.py` loads for the 
+          -production test (stream days 22–28 once) |                    
+      437 -| `selected_model.json` | Model name + tuned settings in plain
+          - text | Human-readable record of what was selected, without lo
+          -ading Python objects |                                        
+      438 -                                                              
+      439 -Artifacts are plain dicts of sklearn / pandas / numpy objects 
+          -(no custom classes), so they load without importing `detect_an
+          -omalies.py`'s internals.                                      
+      428 +**`artifacts/`** – fitted models (each candidate frozen as tun
+          +ed on val, plus `selected_model.joblib` / `.json` for `inferen
+          +ce.py`). Git-ignored: not a required deliverable and rebuilt b
+          +y running `detect_anomalies.py` (~40 s).                      
+      429  
+      430  **`outputs/` – val evidence for the comparison (what the desig
+           n doc and README cite)**
+      431  
+
+● You've already staged four artifact files, and .gitignore doesn't affect files
+  that are already staged. I'll remove them from the index; the files stay on
+  disk.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● artifacts/ is now ignored by git, and design.md describes the folder in one
+  line instead of a table per file.
+
+  - .gitignore: now includes artifacts/.
+  - Staged files: you had already staged 4 artifact files, so I removed them
+    from the staging area with git rm --cached. All 6 files are still on disk,
+    and git status no longer lists them.
+  - design.md: I replaced the artifacts table with one line. It says the folder
+    holds each fitted model frozen as tuned on val, plus the selected_model
+    files for inference.py. It also says the folder is git-ignored because it
+    isn't a required deliverable and detect_anomalies.py rebuilds it in about 40
+    s. The outputs/ table is unchanged.
+
+  Your other staged changes are as you left them. Remaining before Stage 6:
+  commit when you're ready, and run /export.
+
+✻ Churned for 15s · done 7:17 PM
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: C:\Users\Gracy\Projects\Anomaly
+     Detection\004_modelling_eval.txt
+
+❯ lets move to testing with te rules and charts models and see the fianl        
+  numbers                                                                       
+
+● Your export went to the project root, so move 004_modelling_eval.txt into
+  ai_transcripts/ like the earlier ones.
+
+  The test split can only be scored once, so here's the protocol for
+  confirmation before I run it.
+
+  Stage 6 test protocol
+  - Models: the rules and the control charts, each frozen as tuned on val and
+    loaded from artifacts/candidate_*.joblib. Nothing is refit or retuned.
+  - What comes from train: the temperature baseline, the activity rates and the
+    chart centres and scales. They are fit on train, as before.
+  - Test features: the same features.py pipeline, with the 180-min warm-up taken
+    from the end of val.
+  - Scoring: the same rules as val: 15-min grace, cross-sensor and benign-event
+    false alarms reported separately, and delay per anomaly type.
+  - Reported next to val: the overall table, per sensor, per type with delays,
+    and the alert CSVs (outputs/alerts_<model>_test.csv, outputs/test_*.csv).
+  - Code: a separate evaluate_test.py, so test loading never lives in
+    detect_anomalies.py.
+
+  Questions
+  1. Schedule sensitivity on test (medium): should I also score the rules with
+     the wide schedule, using the val-tuned parameters? It's free and shows
+     whether the circularity effect holds on unseen data. I recommend yes,
+     reported but not used for any decision.
+  2. No changes after test (high): if the test numbers are disappointing, we
+     report them as they are and only describe fixes in the README, with no
+     reruns. Agreed?
+  3. Stage 7 consistency check (low): inference.py will later stream test minute
+     by minute through the selected model. I'd check that its alerts exactly
+     match this batch run, which proves the pipeline is causal. Fine to add
+     then?
+
+✻ Cogitated for 14s · done 7:20 PM
+
+※ recap: We're building the smart-home anomaly detection take-home and are now at Stage 6, scoring the rules and control-chart models once on the test split. Next, you answer my three protocol questions, then I run the test.
+
+❯ Agreed; but i take back on two and let run all four models. Yes to all three  
+  questions.                                                                    
+
+● Write(evaluate_test.py)
+  ⎿  Wrote 124 lines to evaluate_test.py
+       1 """Score the frozen val-tuned models on the test split, once (do
+       2 
+       3 Nothing is fit or tuned here: every model, threshold, baseline a
+       4 artifacts/ as saved by detect_anomalies.py. Test labels are used
+       5 
+       6 Pipeline:
+         tes from train via artifacts)
+       8     2. Minute flags -> alerts per model (same code as val)
+         e rules
+         to val
+     … +149 lines (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && sed -i 's/test =
+      load_test(arts\["rules"\])/test = load_test(arts["charts"])   # baseline +
+      activity rates (fi…)
+  ⎿  77:    test = load_test(arts["charts"])   # baseline + activity rates
+     (fit on train)
+     Val vs test:
+     … +90 lines (ctrl+o to expand)
+  ⎿  Updated evaluate_test.py (+1 -1)
+      74  # ============================================================
+      75  def main():
+      76      arts = load_artifacts()
+      77 -    test = load_test(arts["rules"])                            
+      77 +    test = load_test(arts["charts"])   # baseline + activity ra
+         +tes (fit on train)                                             
+      78      labels = F.load_labels()
+      79      labels = labels[labels["split"] == "test"]
+      80      log = F.load_generation_log()
+  ⎿  Created outputs\alerts_charts_test.csv (+19 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +door_front,charts,2024-01-29 03:51:00,2024-01-29 03:51:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+       3 +power_fridge,charts,2024-01-29 09:19:00,2024-01-29 10:11:00,EWM
+         +A of power_fridge below -6 sigma                               
+       4 +temp_living_room,charts,2024-01-29 14:09:00,2024-01-29 18:08:00
+         +,EWMA of temp_dev below -6 sigma                               
+       5 +door_front,charts,2024-01-30 07:16:00,2024-01-30 07:44:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+       6 +temp_living_room,charts,2024-01-30 08:47:00,2024-01-30 08:59:00
+         +,EWMA of temp_dev below -6 sigma                               
+       7 +temp_living_room,charts,2024-01-30 11:57:00,2024-01-30 11:59:00
+         +,EWMA of temp_dev below -6 sigma                               
+       8 +motion_hallway,charts,2024-01-30 15:42:00,2024-01-30 15:42:00,C
+         +USUM of motion_hallway above +80 (CUSUM h)                     
+       9 +power_fridge,charts,2024-01-31 23:45:00,2024-02-01 00:51:00,EWM
+         +A of power_fridge below -6 sigma                               
+      10 +power_fridge,charts,2024-02-02 00:34:00,2024-02-02 01:34:00,EWM
+         +A of fridge_mode_minutes above +6 sigma                        
+      11 +temp_living_room,charts,2024-02-02 10:05:00,2024-02-02 13:50:00
+         +,EWMA of temp_dev below -6 sigma                               
+      12 +door_front,charts,2024-02-02 20:49:00,2024-02-02 20:58:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      13 +door_front,charts,2024-02-02 21:09:00,2024-02-02 21:09:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      14 +door_front,charts,2024-02-02 21:20:00,2024-02-02 21:20:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      15 +door_front,charts,2024-02-02 21:31:00,2024-02-02 21:31:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      16 +door_front,charts,2024-02-03 03:46:00,2024-02-03 03:46:00,CUSUM
+         + of door_front above +80 (CUSUM h)                             
+      17 +temp_living_room,charts,2024-02-03 23:53:00,2024-02-03 23:59:00
+         +,EWMA of temp_dev below -6 sigma                               
+      18 +temp_living_room,charts,2024-02-04 02:57:00,2024-02-04 03:08:00
+         +,EWMA of temp_dev below -6 sigma                               
+      19 +power_fridge,charts,2024-02-04 08:57:00,2024-02-04 09:57:00,EWM
+         +A of fridge_mode_minutes above +6 sigma                        
+  ⎿  Created outputs\alerts_iforest_test.csv (+7 -0)
+      1 +sensor,model,start,end,reason                                   
+      2 +temp_living_room,iforest,2024-01-29 06:59:00,2024-01-29 06:59:00
+        +,"temp_resid = 0.40, above 99.5% of train"                      
+      3 +temp_living_room,iforest,2024-01-31 18:07:00,2024-01-31 18:08:00
+        +,"temp_dev = 5.99, above 100.0% of train"                       
+      4 +temp_living_room,iforest,2024-02-02 12:00:00,2024-02-02 13:03:00
+        +,"temp_rate_60 = -0.89, below 100.0% of train"                  
+      5 +temp_living_room,iforest,2024-02-03 06:58:00,2024-02-03 06:58:00
+        +,"temp_dev = 1.15, above 99.8% of train"                        
+      6 +motion_hallway,iforest,2024-02-03 22:23:00,2024-02-03 22:34:00,"
+        +motion_15 = 11.00, above 99.8% of train"                        
+      7 +temp_living_room,iforest,2024-02-04 06:42:00,2024-02-04 06:42:00
+        +,"temp_dev = 1.08, above 99.7% of train"                        
+  ⎿  Created outputs\alerts_iforest_v2_test.csv (+14 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +door_front,iforest_v2,2024-01-30 07:21:00,2024-01-30 07:46:00,"
+         +door_open_minutes = 9.00, above 99.6% of train"                
+       3 +motion_hallway,iforest_v2,2024-01-30 15:45:00,2024-01-30 15:47:
+         +00,"minutes_since_door_open = 180.00, above 100.0% of train"   
+       4 +temp_living_room,iforest_v2,2024-01-31 18:07:00,2024-01-31 18:0
+         +8:00,"temp_dev = 5.99, above 100.0% of train"                  
+       5 +power_fridge,iforest_v2,2024-02-02 01:27:00,2024-02-02 01:27:00
+         +,"fridge_mode_minutes = 77.00, above 99.3% of train"           
+       6 +temp_living_room,iforest_v2,2024-02-02 11:41:00,2024-02-02 11:4
+         +3:00,"temp_rate_60 = -0.91, below 100.0% of train"             
+       7 +temp_living_room,iforest_v2,2024-02-02 11:57:00,2024-02-02 12:2
+         +3:00,"temp_rate_60 = -0.88, below 100.0% of train"             
+       8 +door_front,iforest_v2,2024-02-02 20:43:00,2024-02-02 21:36:00,"
+         +door_open_minutes = 3.00, above 99.5% of train"                
+       9 +door_front,iforest_v2,2024-02-03 09:11:00,2024-02-03 09:12:00,"
+         +door_usual = 0.17, above 100.0% of train"                      
+      10 +motion_hallway,iforest_v2,2024-02-03 21:36:00,2024-02-03 21:36:
+         +00,"motion_15 = 11.00, above 99.8% of train"                   
+      11 +temp_living_room,iforest_v2,2024-02-04 02:57:00,2024-02-04 02:5
+         +9:00,"temp_dev = -5.75, below 100.0% of train"                 
+      12 +temp_living_room,iforest_v2,2024-02-04 06:55:00,2024-02-04 06:5
+         +5:00,"temp_dev = 1.44, above 99.9% of train"                   
+      13 +door_front,iforest_v2,2024-02-04 09:01:00,2024-02-04 09:01:00,"
+         +door_usual = 0.17, above 100.0% of train"                      
+      14 +power_fridge,iforest_v2,2024-02-04 09:50:00,2024-02-04 09:51:00
+         +,"fridge_mode_minutes = 77.00, above 99.3% of train"           
+  ⎿  Created outputs\alerts_rules_test.csv (+15 -0)
+       1 +sensor,model,start,end,reason                                  
+       2 +door_front,rules,2024-01-29 03:48:00,2024-01-29 03:52:00,door o
+         +pen in night hours (night opening)                             
+       3 +power_fridge,rules,2024-01-29 09:24:00,2024-01-29 10:07:00,frid
+         +ge < 1.0 W for 10 min (power loss)                             
+       4 +temp_living_room,rules,2024-01-29 14:46:00,2024-01-29 16:38:00,
+         +temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (
+         +heating failure)                                               
+       5 +door_front,rules,2024-01-30 07:23:00,2024-01-30 07:46:00,door o
+         +pen > 10 min (left open)                                       
+       6 +motion_hallway,rules,2024-01-30 15:27:00,2024-01-30 15:45:00,"m
+         +otion in away hours, no door opening for 60 min (intrusion)"   
+       7 +temp_living_room,rules,2024-01-31 18:07:00,2024-01-31 18:08:00,
+         +temp jumped > 1.5 degC from recent readings (spike)            
+       8 +power_fridge,rules,2024-01-31 23:51:00,2024-02-01 00:39:00,frid
+         +ge < 1.0 W for 10 min (power loss)                             
+       9 +motion_hallway,rules,2024-02-01 10:39:00,2024-02-01 10:47:00,"m
+         +otion in away hours, no door opening for 60 min (intrusion)"   
+      10 +power_fridge,rules,2024-02-02 00:41:00,2024-02-02 01:28:00,comp
+         +ressor running > 30 min (stuck on)                             
+      11 +temp_living_room,rules,2024-02-02 10:39:00,2024-02-02 12:29:00,
+         +temp 0.5 degC below usual and falling > 0.2 degC/h for 15 min (
+         +heating failure)                                               
+      12 +door_front,rules,2024-02-02 20:51:00,2024-02-02 21:36:00,door o
+         +pen > 10 min (left open)                                       
+      13 +door_front,rules,2024-02-03 03:43:00,2024-02-03 03:47:00,door o
+         +pen in night hours (night opening)                             
+      14 +temp_living_room,rules,2024-02-04 02:57:00,2024-02-04 02:59:00,
+         +temp jumped > 1.5 degC from recent readings (spike)            
+      15 +power_fridge,rules,2024-02-04 09:04:00,2024-02-04 09:51:00,comp
+         +ressor running > 30 min (stuck on)                             
+  ⎿  … 4 more files changed
+  ⎿  (timeout 10m)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+     456:- `evaluate_test.py` loads the four frozen candidates from `artifa
+     cts/` (as tuned on val). Nothing is fit or tuned; baseline, activity r
+     … +5 lines (ctrl+o to expand)
+  ⎿  Updated docs\design.md (+42 -1)
+      450  
+      451  ---
+      452  
+      453 +## Stage 6 – Test Evaluation (run once)                       
+      454 +                                                              
+      455 +### Protocol                                                  
+      456 +- `evaluate_test.py` loads the four frozen candidates from `ar
+          +tifacts/` (as tuned on val). Nothing is fit or tuned; baseline
+          +, activity rates and chart stats come from train via the artif
+          +acts.                                                         
+      457 +- Test features: same `features.py` pipeline, 180-min warm-up 
+          +from the end of val. Test labels are used for scoring only.   
+      458 +- Same scoring rules as val. Rules with the wide schedule are 
+          +scored too (val-tuned params; reported only).                 
+      459 +- **No changes after test:** results are reported as they are;
+          + fixes go to the README only.                                 
+      460 +- Outputs: `outputs/alerts_<model>_test.csv`, `test_comparison
+          +.csv`, `test_per_sensor.csv`, `test_per_type.csv`, `test_sensi
+          +tivity.csv`.                                                  
+      461 +                                                              
+      462 +### Results (seed 42)                                         
+      463 +                                                              
+      464 +| Model | Val errors | Test detected | Test FA | Benign FA | C
+          +ross-sensor FA | **Test errors** | Size | ms / minute |       
+      465 +|---|---|---|---|---|---|---|---|---|                         
+      466 +| Rules | 0 | 14/14 | 0 | 0 | 0 | **0** | 3.2 KB | 0.0005 |   
+      467 +| Control charts | 7 | 12/14 | 3 | 0 | 0 | 5 | 14 KB | 0.006 |
+      468 +| IF v2 | 9 | 8/14 | 4 | 1 | 1 | 10 | 20.9 MB | 0.027 |       
+      469 +| IF v1 | 13 | 2/14 | 4 | 1 | 0 | 16 | 11.5 MB | 0.023 |      
+      470 +                                                              
+      471 +Val ranking holds on test (rules < charts < IF v2 < IF v1).   
+      472 +                                                              
+      473 +**Test detected | median delay (min) per anomaly type**       
+      474 +                                                              
+      475 +| Anomaly type | Rules | Charts | IF v2 | IF v1 |             
+      476 +|---|---|---|---|---|                                         
+      477 +| temp_spike | 2/2 · 0 | 1/2 · 0 | 2/2 · 0 | 1/2 · 0 |        
+      478 +| heating_failure | 2/2 · 54.5 | 2/2 · **19** | 1/2 · 115 | 1/
+          +2 · 134 |                                                     
+      479 +| fridge_power_loss | 2/2 · 9 | 2/2 · **3.5** | 0/2 | 0/2 |   
+      480 +| compressor_stuck_on | 2/2 · 25.5 | 2/2 · **18.5** | 2/2 · 71
+          +.5 | 0/2 |                                                    
+      481 +| intrusion_motion | 2/2 · **2.5** | 1/2 · 17 | 1/2 · 20 | 0/2
+          + |                                                            
+      482 +| door_open_night | 2/2 · **0** | 2/2 · 3 | 0/2 | 0/2 |       
+      483 +| door_left_open | 2/2 · 10 | 2/2 · 5.5 | 2/2 · **5** | 0/2 | 
+      484 +                                                              
+      485 +- **Rules:** 0 errors again; wide schedule adds 1 motion FA (1
+          + error). Same circularity caveat: rule recall is an upper boun
+          +d.                                                            
+      486 +- **Charts:** the 3 FAs are all `temp_dev` low (Tue 01‑30 08:4
+          +7 and 11:57, Sat 02‑03 23:53). The one spike caught is the neg
+          +ative one (−5.5 °C), which drops `temp_dev` sharply; the posit
+          +ive spike is not a chart target. Night door openings were 2/2 
+          +on test (0/2 on val): with 2 per split, this is small-sample v
+          +ariation.                                                     
+      487 +- **IF v2:** door FAs at weekend 09:00 and a weekend-guests mo
+          +tion FA; misses both power losses on test (caught on val).    
+      488 +- **IF v1:** worst on test (2/14), consistent with val.       
+      489 +- Small samples (2 per type): per-type differences of one anom
+          +aly are within noise; the overall ranking is the robust result
+          +.                                                             
+     … 12 more lines (ctrl+o to expand)
+
+● I scored all four models on the test split once, with no refitting or
+  retuning. The val ranking held on test, and the rules were again perfect.
+
+  ┌──────────────┬─────────┬───────────┬─────────────────────────┬─────────┐
+  │    Model     │  Val    │   Test    │    Test false alarms    │  Test   │
+  │              │ errors  │ detected  │                         │ errors  │
+  ├──────────────┼─────────┼───────────┼─────────────────────────┼─────────┤
+  │ Rules        │ 0       │ 14/14     │ 0                       │ 0       │
+  ├──────────────┼─────────┼───────────┼─────────────────────────┼─────────┤
+  │ Control      │ 7       │ 12/14     │ 3                       │ 5       │
+  │ charts       │         │           │                         │         │
+  ├──────────────┼─────────┼───────────┼─────────────────────────┼─────────┤
+  │ Isolation    │         │           │ 4 (1 on weekend guests, │         │
+  │ Forest v2    │ 9       │ 8/14      │  1 during another       │ 10      │
+  │              │         │           │ sensor's anomaly)       │         │
+  ├──────────────┼─────────┼───────────┼─────────────────────────┼─────────┤
+  │ Isolation    │ 13      │ 2/14      │ 4 (1 on weekend guests) │ 16      │
+  │ Forest v1    │         │           │                         │         │
+  └──────────────┴─────────┴───────────┴─────────────────────────┴─────────┘
+
+  Detected and median delay per anomaly type on test (rules vs control charts):
+
+  ┌─────────────────────┬───────────────┬───────────────────────────────┐
+  │    Anomaly type     │     Rules     │        Control charts         │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Heating failure     │ 2/2, 54.5 min │ 2/2, 19 min                   │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Fridge power loss   │ 2/2, 9 min    │ 2/2, 3.5 min                  │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Compressor stuck on │ 2/2, 25.5 min │ 2/2, 18.5 min                 │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Intrusion           │ 2/2, 2.5 min  │ 1/2, 17 min                   │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Door open at night  │ 2/2, 0 min    │ 2/2, 3 min                    │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Door left open      │ 2/2, 10 min   │ 2/2, 5.5 min                  │
+  ├─────────────────────┼───────────────┼───────────────────────────────┤
+  │ Temperature spike   │ 2/2, 0 min    │ 1/2 (the negative spike only) │
+  └─────────────────────┴───────────────┴───────────────────────────────┘
+
+  - Rules: 0 errors again. With the wider schedule they make 1 error (a motion
+    false alarm). Their recall is still an upper bound, because the schedule
+    matches the windows the generator used to inject anomalies.
+  - Control charts:
+    - Clearly fastest on the gradual and sustained anomalies.
+    - All 3 false alarms come from temperature running below its usual level
+      (Tue 01‑30 08:47 and 11:57, Sat 02‑03 23:53).
+    - They caught both night door openings on test after missing both on val.
+      With 2 per type, that's sample noise.
+  - Isolation Forest v2: it missed both fridge power losses on test, which it
+    caught on val. Its false alarms were door alerts at weekend 09:00 and one
+    motion alert during the weekend guests' visit.
+  - Small samples: with 2 anomalies per type, a difference of one is within
+    noise. The overall ranking is the solid result.
+
+  The rules stay the selected model. The README can recommend charts for the
+  fridge and heating as an extension.
+
+  New file evaluate_test.py loads the frozen models from artifacts/ and fits
+  nothing. The test outputs are in outputs/ (alerts_<model>_test.csv,
+  test_comparison.csv, test_per_sensor.csv, test_per_type.csv,
+  test_sensitivity.csv). design.md has a new Stage 6 section with the protocol
+  and these results, and the README carry-over now has the test summary and the
+  updated run order.
+
+  Next is Stage 7: inference.py streams the test days minute by minute through
+  the selected model, with a check that its alerts exactly match this batch run.
+  Run /export before we start it, and nothing is committed yet.
+
+✻ Cooked for 1m 18s · done 7:29 PM
+
+※ recap: We're building the smart-home anomaly detection take-home, and the one-time test evaluation is done: rules made 0 errors, control charts 5, Isolation Forest v2 10 and v1 16. Next, export the transcript, then build the Stage 7 streaming inference check.
+
+❯ Skip stage 7. The task only asks for production discussion, so we will cover  
+  it in text. Tag 3b32d9e as 'frozen-before-test' with the note in design.md    
+  and then once i commit lets start with readme.                                
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Model code is unchanged since 3b32d9e, so the tag marks exactly the frozen
+  state. Tagging and updating design.md.
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && git tag -a
+      frozen-before-test 3b32d9e -m "Models, thresholds and tuning frozen on val
+      before the one-time test…)
+  ⎿  frozen-before-test Models, thresholds and tuning frozen on val before
+     the one-time test evaluation (Stage 6)
+     ok
+  ⎿  Updated docs\design.md (+11 -6)
+      73  ├── features.py           # shared cleaning + causal features
+      74  ├── analysis.ipynb        # cleaning decisions, EDA plots
+      75  ├── detect_anomalies.py   # train/compare models on train+val, 
+          save best, write alerts
+      76 -├── inference.py          # stream test days line by line with 
+         -saved model                                                    
+      76 +├── evaluate_test.py      # score frozen models on test, once (
+         +replaces inference.py; Stage 7 skipped)                        
+      77  ├── data/                 # sensor readings CSV and labels CSV 
+          (separate files)
+      78 -├── artifacts/            # saved model, thresholds, preprocess
+         -ing config                                                     
+      78 +├── artifacts/            # saved models, thresholds, preproces
+         +sing config (git-ignored, rebuilt)                             
+      79  ├── outputs/              # alerts CSVs, metrics
+      80  ├── docs/                 # plan, task, design
+      81  └── ai_transcripts/       # exported AI session transcripts, on
+          e per phase
+      82  ```
+      83  
+      84  ### Decisions
+      85 -- **`features.py`:** single source of cleaning and feature logi
+         -c, shared by `detect_anomalies.py` and `inference.py`, so train
+         -ing and production cannot drift apart. `analysis.ipynb` justifi
+         -es the choices but does not hold production code.              
+      85 +- **`features.py`:** single source of cleaning and feature logi
+         +c, shared by `detect_anomalies.py` and `evaluate_test.py` (and 
+         +any future production stream), so training and production canno
+         +t drift apart. `analysis.ipynb` justifies the choices but does 
+         +not hold production code.                                      
+      86  - **`config.py`:** single place for sensors, split dates, rando
+          m seed and paths.
+      87  - **`detect_anomalies.py`:** writes an alerts CSV (timestamp, s
+          ensor, score/rule, reason), as the task requires, in addition t
+          o comparing and saving models.
+      88  - **Generated data is committed to git.** Sensor readings and l
+          abels are kept in separate files. The generator is fully reprod
+          ucible from the seed in `config.py`.
+     ...
+      425  ### Files produced by `detect_anomalies.py` (and why)
+      426  One run writes everything below; all are reproducible from the
+            seed. Test is never loaded, so every file here is train-fit /
+            val-scored only.
+      427  
+      428 -**`artifacts/`** – fitted models (each candidate frozen as tun
+          -ed on val, plus `selected_model.joblib` / `.json` for `inferen
+          -ce.py`). Git-ignored: not a required deliverable and rebuilt b
+          -y running `detect_anomalies.py` (~40 s).                      
+      428 +**`artifacts/`** – fitted models (each candidate frozen as tun
+          +ed on val, plus `selected_model.joblib` / `.json` for deployme
+          +nt). Git-ignored: not a required deliverable and rebuilt by ru
+          +nning `detect_anomalies.py` (~40 s).                          
+      429  
+      430  **`outputs/` – val evidence for the comparison (what the desig
+           n doc and README cite)**
+      431  
+     ...
+      457  - Test features: same `features.py` pipeline, 180-min warm-up 
+           from the end of val. Test labels are used for scoring only.
+      458  - Same scoring rules as val. Rules with the wide schedule are 
+           scored too (val-tuned params; reported only).
+      459  - **No changes after test:** results are reported as they are;
+            fixes go to the README only.
+      460 +- **Frozen state is tagged:** git tag `frozen-before-test` on 
+          +commit `3b32d9e` = models, features, config and val tuning as 
+          +they were before test was loaded. `detect_anomalies.py`, `feat
+          +ures.py` and `config.py` are unchanged since that tag (`git di
+          +ff frozen-before-test -- detect_anomalies.py features.py confi
+          +g.py` is empty), so reviewers can verify nothing was changed a
+          +fter seeing test.                                             
+      461  - Outputs: `outputs/alerts_<model>_test.csv`, `test_comparison
+           .csv`, `test_per_sensor.csv`, `test_per_type.csv`, `test_sensi
+           tivity.csv`.
+      462  
+      463  ### Results (seed 42)
+     ...
+      489  - **IF v1:** worst on test (2/14), consistent with val.
+      490  - Small samples (2 per type): per-type differences of one anom
+           aly are within noise; the overall ranking is the robust result
+           .
+      491  
+      492 +## Stage 7 – Production Test (skipped)                        
+      493 +- Decision: skipped. The task asks only for a production discu
+          +ssion, so streaming is covered in the README text, not code.  
+      494 +- Not done: `inference.py` streaming test minute by minute and
+          + checking its alerts match the batch run. The pipeline is caus
+          +al by design (Stage 4), which is what makes the batch test res
+          +ult representative of streaming; the README states this was no
+          +t verified with a streaming run.                              
+     … 14 more lines (ctrl+o to expand)
+
+● I tagged 3b32d9e as frozen-before-test and updated design.md. The tag is local
+  only; I haven't pushed it.
+
+  - Tag: it's an annotated tag with the message "Models, thresholds and tuning
+    frozen on val before the one-time test evaluation (Stage 6)".
+    detect_anomalies.py, features.py and config.py are unchanged since 3b32d9e.
+    So the tag marks exactly the state test was scored with, and anyone can
+    check that with git diff frozen-before-test -- detect_anomalies.py 
+    features.py config.py.
+  - Stage 6 in design.md: now notes the tag and how to verify it.
+  - Stage 7 in design.md: recorded as skipped, with the reason. It also says the
+    streaming-equals-batch check was never run, and the README will say so too.
+  - Repo layout in design.md: inference.py is replaced by evaluate_test.py, and
+    artifacts/ is marked git-ignored. The run order now ends at
+    evaluate_test.py.
+  - README carry-over: the production section is text only. It covers
+    minute-by-minute streaming with the same causal features.py and the frozen
+    model.
+
+  Ready for your commit: evaluate_test.py, the 8 test output CSVs, design.md,
+  and ai_transcripts/004_modelling_eval.txt. Your last commit also added
+  004_modelling_eval.txt at the root. You've since deleted it locally, and that
+  deletion should go into the same commit.
+
+  Run /export before we start the README.
+
+✻ Crunched for 31s · done 8:21 PM
+
+※ recap: We're building the smart-home anomaly detection take-home; models are compared, test-scored once, and tagged frozen-before-test. Next: you commit the pending Stage 6 files and export the transcript, then we start the README.
+
+❯ committed, lets start with the readme                                         
+
+  Ran 1 shell command (ctrl+o to expand)
+● Here's my proposed outline for README.md. It draws on task.md and the README
+  Carry-Over section in design.md.
+
+  1. Overview: the approach in about 5 bullets, plus one headline results table
+     (test errors for all four models).
+  2. Quickstart: setup (pip install -r requirements.txt), run order with
+     runtimes, and a short repo layout.
+  3. Synthetic data: the household, the 4 sensors and their normal patterns. It
+     also covers events vs anomalies and the data-quality issues.
+  4. Anomaly definitions: a table of the 7 types with their real-world meaning
+     and their split counts.
+  5. Cleaning and features: causal processing, what is learned from train only,
+     and the warm-up.
+  6. Models and justification: rules, the two Isolation Forests, and the control
+     charts, with a trade-off table. It also explains why rules were selected
+     and the circularity caveat.
+  7. Evaluation protocol: scoring rules, val tuning, the frozen-before-test tag,
+     and the single test run.
+  8. Results: val vs test, delay per anomaly type, the schedule sensitivity
+     check, and small-sample caveats.
+  9. Productionization: on-device real-time serving, monitoring, and cloud
+     retraining.
+  10. Limitations and future work: SHAP explanations, a hybrid of charts and
+      rules, a streaming-equals-batch check, and real data.
+  11. Process and AI usage: the stage-by-stage workflow, reviewer passes,
+      corrections made along the way, and the transcript index.
+
+  Questions
+  1. Depth (high): I recommend a self-contained README of about 300–400 lines
+     that links to design.md for detail. The alternative is a short README that
+     defers most content to design.md. Which do you prefer?
+  2. Recommendation framing (high): rules are the selected model. My suggestion
+     is to recommend a hybrid for production: control charts for fridge and
+     heating drift, rules for door and motion context, because the rules carry
+     design bias. It would be labelled as a recommendation, not built or tested.
+     OK?
+  3. Figures (medium): should I embed 1–2 existing EDA plots from outputs/eda/,
+     such as the train-week plot? I'd add no new plots.
+  4. Productionization (medium): I'd cover:
+     - Serving: on-device, streaming every minute.
+     - Monitoring: alert rate per sensor, feature drift against the train
+       baseline, offline rates, and user feedback on alerts.
+     - Retraining: in the cloud on a schedule plus a drift trigger, using
+       feedback as labels, with a shadow test before each update ships.
+
+     Anything specific you want added or removed?
+  5. Process section (low): a short account of how the AI assistant was used,
+     including the reviewer findings and my mistakes that were caught (the CUSUM
+     restart bug, the misreported delay). OK to include those openly?
+
+✻ Crunched for 21s · done 8:56 PM
+
+❯ 1 self-contained, 3. no plots(I owuld prefer it a short verison of the        
+  design). 2. Rules were sleceted based validation, but their  score dependss   
+  on a configured schedule that matches how the data was generated, so its an   
+  upper bound. For  a real deployment, I would investigate a hybrid,: contraol  
+  charts(EWMA) on fridge power and heating drift where there are faster on      
+  validation and need no handwritten schedule, and rules for door and motion,   
+  where the anomaoly depends on the time of day and charts cannot see it. A     
+  further extension woiuld be chart residuals from a context adjusted expected  
+  value instead of raw readings. 4. go ahead                                    
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Write(README.md)
+  ⎿  Wrote 294 lines to README.md
+      1 # Smart-Home IoT Anomaly Detection (PoC)
+      3 A proof of concept that detects anomalies in four smart-home sens
+        ors (living-room temperature, fridge power, hallway motion, front
+        **causal and per sensor**, so it can run in real time on a home h
+        ub. Four detectors are compared: rules, two Isolation Forests and
+      4 
+      5 Full decision log: [`docs/design.md`](docs/design.md). This READM
+      6 
+      7 ---
+      9 ## 1. Overview
+     … +467 lines (ctrl+o to expand)
+
+● I've written README.md as a self-contained short version of design.md, with no
+  plots.
+
+  It has 11 sections:
+  1. Overview, with the headline test table
+  2. Setup and run order
+  3. Synthetic data
+  4. Anomaly definitions
+  5. Cleaning and features
+  6. Models and justification
+  7. Evaluation protocol
+  8. Results, val vs test and delay per anomaly type
+  9. Productionization
+  10. Limitations and future work
+  11. Process and AI usage, with the transcript index
+
+  Your decisions as written:
+  - Section 6 recommendation: rules were selected on validation, but their score
+    is an upper bound because their schedule matches how the data was
+    generated. For a real deployment it recommends investigating a hybrid: EWMA
+    charts for fridge power and heating drift, and rules for door and motion.
+    The extension of charting residuals from a context-adjusted expected value
+    is listed as further work.
+  - Section 9 production: serving on the device in real time, monitoring, and
+    cloud retraining with a shadow-mode check before release. It states plainly
+    that the streaming-equals-batch check was not run.
+  - Section 11 corrections: listed openly, including my CUSUM restart bug and
+    the delay I misreported. You didn't answer that question, so I went with
+    including them. Tell me if you'd rather cut it down.
+
+  Before you submit:
+  1. Push the tag (high): frozen-before-test exists only on your machine, and
+     the README tells reviewers to git diff against it. Run git push origin 
+     frozen-before-test along with your normal push.
+  2. Last transcript (medium): the transcript table has a 005_*.txt placeholder
+     for this final phase. Once you've exported it, tell me the filename and
+     I'll fill it in, or edit the row yourself.
+  3. Runtimes (low): the run commands are listed without timings because I
+     didn't measure them.
+
+  Please read it through, especially sections 6 and 9.
+
+✻ Sautéed for 1m 42s · done 9:12 PM
+
+※ recap: README.md for the smart-home anomaly-detection take-home is written and ready for your review, especially sections 6 and 9. Next, push the frozen-before-test tag with git push origin frozen-before-test so reviewers can check against it.
+
+❯ Other additions: 1.  say a second Claude Code session acted as an independent 
+  reviewer, with its findings verified against the data before fixing. 2.       
+  note: fix the stage list to match plan.md: the production test stage was      
+  skipped, and README is the last stage. Models not used:  I did not try        
+  forecasting or sequence models based on the bwlo reasons, 1. Little data      
+  2.Two sensors are binary and one sensor is cyclic. Forecasting models suit    
+  contnious series of which we have only one sensor. 3. Hardware: Isolation     
+  forst already was a bit big. 4. Explanablity was focused most as its needed.  
+  Add it in the appropraite sections.                                           
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(README.md)
+  ⎿  Added 6 lines
+      158  - **Isolation Forest** is the standard unsupervised method for
+            tabular data. **Weaknesses:** it scores each minute independe
+           ntly, it is diluted by context columns (v1), and it is the lar
+           gest and slowest model.
+      159  - **Control charts** are a classic, lightweight way to detect 
+           gradual drift, with no hand-written schedule. **Weakness:** sh
+           ort or purely time-of-day anomalies give them little evidence 
+           to accumulate.
+      160  
+      161 +**Models not tried: forecasting and sequence models** (e.g. AR
+          +IMA/Prophet residuals, LSTM or autoencoders).                 
+      162 +- **Little data:** 14 days of train, with unlabelled anomalies
+          + in it, is too little to fit a sequence model reliably.       
+      163 +- **Sensor types:** forecasting suits continuous series, and o
+          +nly temperature is one. Motion and door are binary, and fridge
+          + power is a cyclic on/off signal that is better described by i
+          +ts mode and run length.                                       
+      164 +- **Hardware:** the target is a home hub, and Isolation Forest
+          + was already the largest model (11–21 MB). A sequence model wo
+          +uld be larger and slower.                                     
+      165 +- **Explainability:** alerts must make sense to a non-expert u
+          +ser. Rules and charts give a direct reason; a forecast error f
+          +rom a neural network does not.                                
+      166 +                                                              
+      167  **Tuning and selection:**
+      168  - **Objective:** misses and false alarms are equally costly. E
+           ach sensor is tuned to minimise **misses + false alarms** on v
+           al. Ties go to the lower detection delay, then to the more con
+           servative setting.
+      169  - **Selection:** one model is selected by total val errors. **
+           Rules were selected:** 0 val errors, against 7 for charts, 9 f
+           or IF v2 and 13 for IF v1.
+
+● Update(README.md)
+  ⎿  Added 5 lines, removed 4 lines
+      273  The work followed a stage-by-stage plan ([`docs/plan.md`](docs
+           /plan.md)). At each stage the AI assistant (Claude Code) propo
+           sed options and trade-offs, I decided, and the decisions were 
+           logged in [`docs/design.md`](docs/design.md) before moving on.
+            The stages were:
+      274  1. problem understanding;
+      275  2. repo structure;
+      276 -3. dataset design and generation;                             
+      276 +3. dataset design, creation and split;                        
+      277  4. cleaning and EDA;
+      278  5. model comparison;
+      279 -6. test evaluation;                                           
+      280 -7. README.                                                    
+      279 +6. evaluation and selection, ending with the single test run (
+          +`evaluate_test.py`);                                          
+      280 +7. production test: **skipped** by decision, because the task 
+          +asks only for a production discussion (§9);                   
+      281 +8. README (this document, last).                              
+      282  
+      282 -A separate reviewer agent checked the work several times. Corr
+          -ections are documented rather than hidden:                    
+      283 +**Independent review:** a second Claude Code session acted as 
+          +an independent reviewer of the data, features and implementati
+          +on at several points. I verified each of its findings against 
+          +the data or the outputs before anything was fixed, and the fix
+          + was agreed before it was applied. Corrections are documented 
+          +rather than hidden:                                           
+      284  - **Simulator realism:** fridge idle noise, cooling lag, anoma
+           ly durations, motion on arrival, stray motion, heating-recover
+           y labels, door/motion timing, intrusion motion count.
+      285  - **Features:** a start-up burn-in, a split warm-up, a median-
+           smoothed rate, a spike residual, a door-link feature, a pooled
+            baseline, and NaN for door-dependent features when the door s
+           ensor was offline.
+      286  - **Models:**
+
+● Recording the "models not tried" decision in design.md as well, so the two
+  documents match.
+
+● Update(docs\design.md)
+  ⎿  Added 7 lines
+      441  
+      442  `outputs/eda/` (Stage 4 plots) is written by `analysis.ipynb`,
+            not by this script.
+      443  
+      444 +### Models not tried (decision)                               
+      445 +No forecasting or sequence models (ARIMA/Prophet residuals, LS
+          +TM, autoencoders):                                            
+      446 +1. **Little data:** 14 train days, with unlabelled anomalies i
+          +n them.                                                       
+      447 +2. **Sensor types:** forecasting suits continuous series, and 
+          +only temperature is one. Motion and door are binary; fridge po
+          +wer is cyclic and better described by mode and run length.    
+      448 +3. **Hardware:** on-device target, and Isolation Forest was al
+          +ready the largest model (11–21 MB).                           
+      449 +4. **Explainability:** the main requirement; rules and charts 
+          +give direct reasons.                                          
+      450 +                                                              
+      451  ### Stage 5 implementation notes and corrections
+      452  - **Code:** all four models live in `detect_anomalies.py` (sec
+           tions 2a rules, 2b IF v1/v2, 2c charts), share the alert/scori
+           ng/tuning code, and save `artifacts/candidate_<model>.joblib`;
+            the selected one is copied to `selected_model.joblib` (+ `.js
+           on`). Tie order for selection: rules → charts → IF v2 → IF v1 
+           (simpler first).
+      453  - **Bug fixed before reporting:** CUSUM did not restart after 
+           a signal; after the 01‑26 heating failure the lower sum stayed
+            above the limit for 2.5 days, giving one alert that covered b
+           oth failures and hid false alarms. Fixed (restart at 0 after a
+            signal).
+
+● I've added all three points to README.md.
+
+  1. Independent reviewer (§11 Process and AI usage): it now says a second
+     Claude Code session acted as an independent reviewer at several points. It
+     also says each finding was checked against the data or outputs before
+     anything was fixed, and each fix was agreed first. The list of corrections
+     follows.
+  2. Stage list (§11): it now matches plan.md with 8 stages. Stage 6,
+     "Evaluation and selection", ends with the single test run. Stage 7,
+     "Production test", is marked skipped by decision and points to the
+     production discussion in §9. The README is stage 8, the last one.
+  3. Models not tried (§6 Models and justification): a new block after "Why
+     these four" explains why no forecasting or sequence models were used. It
+     gives your four reasons:
+     - too little data, and the training data contains unlabelled anomalies;
+     - two sensors are binary and one is cyclic, so only temperature is a
+       continuous series that forecasting suits;
+     - hardware, since Isolation Forest was already 11–21 MB;
+     - explainability, which was the main requirement.
+
+  I also added the same "Models not tried" decision to design.md Stage 5, so the
+  decision log and the README agree.
+
+  Still open: push the frozen-before-test tag, and fill in the 005_*.txt
+  transcript row once you've exported.
+
+✻ Baked for 27s · done 9:41 PM
+
+※ recap: We're finishing the smart-home anomaly detection take-home, and the README is written with your reviewer, stage list and models-not-tried additions. Next, push the frozen-before-test tag, export this last transcript and tell me its filename for the README.
+
+❯ 1. Readme points to be added: benign events never reach th etrigger 2.data    
+  qulaity issues never overlap anomalies; real failures come iwth outages 3.a   
+  Bernoulli/Poisson CUSUM on counts would fit better for binary/motion/door     
+
+● Update(README.md)
+  ⎿  Added 5 lines
+      257  ## 10. Limitations and future work
+      258  
+      259  - **Synthetic data, one designer:** the simulator and the rule
+           s share assumptions, so all scores are optimistic. Real homes 
+           are noisier: pets, irregular schedules, multiple rooms.
+      260 +- **Benign events never reach the rule triggers:**            
+      261 +  - Night bathroom trips are motion without a door opening, ou
+          +tside the away hours.                                         
+      262 +  - Weekend guests' door openings are short and happen 19:00–2
+          +3:30, outside the night window.                               
+      263 +  - So the rules' 0 false alarms on benign events is also part
+          +ly by construction. Real distractors (a late-night delivery, a
+          + cleaner on an office day) would hit the triggers.            
+      264 +- **Data-quality issues never overlap anomalies:** outages wer
+          +e placed apart from anomalies to keep labels unambiguous. Real
+          + failures often come with outages: a power cut stops the fridg
+          +e *and* the hub, and a dying sensor drifts before it goes offl
+          +ine. The detectors skip offline minutes, so an anomaly during 
+          +an outage would be missed or detected late.                   
+      265  - **Small evaluation:** 14 anomalies per split, so per-type re
+           call can only be 0, 50 or 100%.
+      266  - **One season, one household, no daylight-saving change.** Th
+           e baselines would need refitting across seasons.
+      267  - **Contaminated train:** unlabelled anomalies in train make l
+           ong fridge runs and door openings look less rare to Isolation 
+           Forest.
+
+● Update(README.md)
+  ⎿  Added 1 line
+      267  - **Contaminated train:** unlabelled anomalies in train make l
+           ong fridge runs and door openings look less rare to Isolation 
+           Forest.
+      268  - **Future work:**
+      269    - the hybrid model and context-adjusted chart residuals (§6)
+           ;
+      270 +  - a Bernoulli or Poisson CUSUM on motion/door counts. The cu
+          +rrent charts standardise the binary readings as if they were G
+          +aussian, so the chart limits have no exact false-alarm meaning
+          +. A count-based likelihood-ratio CUSUM fits binary and count d
+          +ata properly;                                                 
+      271    - SHAP explanations for Isolation Forest (`shap.TreeExplaine
+           r`) instead of the "most extreme feature" explanation;
+      272    - a streaming-equals-batch test;
+      273    - multi-sensor rooms and a learned household schedule to rep
+           lace the configured one.
+
+● Update(docs\design.md)
+  ⎿  Added 2 lines
+      539  - **Circularity caveat (must be stated):** the rule schedule m
+           atches the injection windows, so rule recall is an upper bound
+           . Show the schedule sensitivity result (wide schedule: 14/14, 
+           2 FA vs 0) and that a user-entered schedule is a deployment ri
+           sk.
+      540  - **Model comparison (Stage 5):** rules, IF v1, IF v2 (fewer s
+           ensor-specific inputs + learned activity rates), EWMA/CUSUM co
+           ntrol charts. Show the val comparison table and the per-type d
+           elay table. Key points: charts are fastest on gradual/sustaine
+           d anomalies (heating failure ~21 vs ~59 min, power loss, stuck
+           -on) and miss short night door openings; they target shifts on
+           ly (spikes left to rules, after `temp_resid` on heat-up ramps 
+           caused 9 FA); IF improves with focused inputs but still misses
+            duration/context anomalies; only rules catch the context-depe
+           ndent ones, helped by the schedule.
+      541  - **Process notes for Stage 5:** CUSUM restart bug found and f
+           ixed before reporting; reviewer caught a misreported delay (pe
+           r-sensor median hid per-type differences), so delays are now r
+           eported per type.
+      542 +- **Limitations (by construction):** benign events never reach
+          + the rule triggers (bathroom trips are motion without door out
+          +side away hours; guests' openings are short and before 00:00),
+          + so the rules' 0 benign FA is partly designed in. Data-quality
+          + issues never overlap anomalies, whereas real failures often c
+          +ome with outages (a power cut stops fridge and hub).          
+      543 +- **Chart extension:** a Bernoulli/Poisson CUSUM on motion/doo
+          +r counts would fit binary data better than the Gaussian-standa
+          +rdised 0/1 signal used now.                                   
+      544  - **Possible extension:** a hybrid (charts for fridge/heating 
+           drift, rules for context-dependent door/motion) — not built.
+      545  - **Heating failure is contextual:** normal setback cooling (~
+           0.6 °C/h at its start) overlaps the slowest failures. The rate
+            of fall alone is not enough; the detector needs the context (
+           target 21 °C, awake and home).
+      546  - **Productionization (text only, Stage 7 skipped):** on-devic
+           e serving; describe minute-by-minute streaming with the same c
+           ausal `features.py` and the frozen artifact, and note that a s
+           treaming-equals-batch check was not run. Cloud is used for ret
+           raining and model updates. Monitoring and retraining strategy 
+           still to be written.
+
+● I've added all three points to the README's §10 Limitations and future work,
+  and briefly to the README carry-over section of design.md.
+
+  1. Benign events never reach the rule triggers (limitations): the generator
+     was designed so they don't.
+     - Night bathroom trips are motion with no door opening, and they fall
+       outside the away hours.
+     - The weekend guests' door openings are short and happen 19:00–23:30,
+       outside the night window.
+     - So the rules' 0 false alarms on benign events is partly built in. I've
+       given two realistic examples that would set the rules off: a late-night
+       delivery, and a cleaner coming on an office day.
+  2. Data-quality issues never overlap anomalies (limitations): in real homes,
+     failures often come with outages. A power cut stops both the fridge and the
+     hub, and a dying sensor drifts before it goes offline. The detectors skip
+     offline minutes, so an anomaly during an outage would be missed or caught
+     late.
+  3. Bernoulli/Poisson CUSUM (future work): the current charts treat the 0/1
+     motion and door readings as if they were normally distributed, so a chart
+     limit doesn't correspond to a known false-alarm rate. A count-based
+     likelihood-ratio CUSUM is the proper method for binary and count data.
+
+  Still open: push the frozen-before-test tag, and fill in the 005_*.txt
+  transcript row after your final export.
+
+✻ Cooked for 20s · done 9:56 PM
+
+※ recap: We're finishing your smart-home anomaly detection take-home, and the README is drafted with all your additions. Next, read through README sections 6, 9 and 10, then push the frozen-before-test tag and export the final transcript.
+
+❯ In #9, use the hub for refit and the cloude for release gate, versioned       
+  artifacts, and rollback. 2.Change "the stream runs exactly the codethat was   
+  evalauated" to "designed to run the same code". 3. write assumnbed fbefore    
+  home-hu b                                                                     
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+  ⎿  Updated docs\design.md (+1 -1)
+      543  - **Chart extension:** a Bernoulli/Poisson CUSUM on motion/doo
+           r counts would fit binary data better than the Gaussian-standa
+           rdised 0/1 signal used now.
+      544  - **Possible extension:** a hybrid (charts for fridge/heating 
+           drift, rules for context-dependent door/motion) — not built.
+      545  - **Heating failure is contextual:** normal setback cooling (~
+           0.6 °C/h at its start) overlaps the slowest failures. The rate
+            of fall alone is not enough; the detector needs the context (
+           target 21 °C, awake and home).
+      546 -- **Productionization (text only, Stage 7 skipped):** on-devic
+          -e serving; describe minute-by-minute streaming with the same c
+          -ausal `features.py` and the frozen artifact, and note that a s
+          -treaming-equals-batch check was not run. Cloud is used for ret
+          -raining and model updates. Monitoring and retraining strategy 
+          -still to be written.                                          
+      546 +- **Productionization (text only, Stage 7 skipped):** on-devic
+          +e serving; describe minute-by-minute streaming with the same c
+          +ausal `features.py` and the frozen artifact, and note that a s
+          +treaming-equals-batch check was not run. Statistics are refit 
+          +on the hub (raw data stays local); the cloud runs the release 
+          +gate (replay + confirmed incidents), keeps versioned artifacts
+          + and handles rollback; shadow mode on the hub before release. 
+          +Written in README §9.                                         
+      547  - **AI transcripts:** exported per phase into `ai_transcripts/
+           `.
+      548  - **Repo layout:** the tree and a one-line role for each file 
+           (Stage 2).
+      549  - **Test results (Stage 6):** show the val-vs-test table and t
+           he per-type table; val ranking held on test (rules 0, charts 5
+           , IF v2 10, IF v1 16 errors). Repeat the circularity caveat ne
+           xt to the rules' 0.
+
+● I've made all three changes to the README.
+
+  1. §9 Retraining: the heading is now "refit on the hub, release managed in the
+     cloud".
+     - Refit on the hub: only the small statistics are refit, on recent weeks
+       with confirmed-anomaly windows left out, so raw home data stays on the
+       device.
+     - Release gate in the cloud: the hub uploads only the candidate statistics
+       (a few KB, no raw data). The cloud replays injected anomalies and
+       user-confirmed incidents through them. A candidate that passes runs in
+       shadow mode on the hub before it ships.
+     - Versioned artifacts and rollback: the cloud keeps every released version
+       with its gate results, so the hub can roll back to the last good one.
+  2. Wording: it now says "the stream is designed to run the same code that was
+     evaluated".
+  3. "Assumed home hub": I changed all three places the hub is named as the
+     target: the overview, the "Models not tried" hardware reason, and the §9
+     serving bullet. I left the "hub outage" data-quality term and "a power cut
+     stops the fridge and the hub" unchanged, since those describe the simulated
+     hub.
+
+  I also updated the productionization line in design.md's README carry-over to
+  match, since it still said "cloud for retraining".
+
+  Still open: push the frozen-before-test tag, and fill in the 005_*.txt
+  transcript row after your final export.
+
+✻ Brewed for 38s · done 10:15 PM
+❯ Recommendation for a real deployment (not built or tested): investigate a     
+  hybrid.                                                                       
+                                                                                
+  EWMA control charts for fridge power and heating drift. They were faster on   
+  val (heating failure ~21 vs ~59 min, power loss 4.5 vs 9 min) and need no     
+  hand-written schedule.                                                        
+  Rules for door and motion, where the anomaly depends on the time of day and   
+  charts cannot see it.                                                         
+  A further extension: chart residuals from a context-adjusted expected value   
+  instead of raw readings.                                                      
+  add the final selection of the hybrid approach to #9                          
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(README.md)
+  ⎿  Added 14 lines
+      226  
+      227  ## 9. Productionization
+      228  
+      229 +**What is deployed: the hybrid (final selection for production
+          +).**                                                          
+      230 +The PoC selected the rules on val. Their score is an upper bou
+          +nd, because their schedule matches the generator, so the produ
+          +ction configuration is the hybrid from §6, chosen per sensor: 
+      231 +                                                              
+      232 +| Sensor | Detector | Why |                                   
+      233 +|---|---|---|                                                 
+      234 +| Fridge power | EWMA control chart (power and run length per 
+          +mode) | Faster on val (power loss 4.5 vs 9 min, stuck-on 19 vs
+          + 26 min); no schedule needed |                                
+      235 +| Temperature | EWMA chart on `temp_dev` for heating drift + t
+          +he spike rule (\|`temp_resid`\| > 1.5 °C) | Chart is faster on
+          + heating failure (~21 vs ~59 min on val); charts do not target
+          + spikes |                                                     
+      236 +| Motion | Rules (intrusion: away hours + no door opening) | T
+          +he anomaly depends on time of day and the door link; charts ca
+          +nnot see it |                                                 
+      237 +| Door | Rules (night opening, left open > 10 min) | Same: nig
+          +ht openings are short and purely time-of-day |                
+      238 +                                                              
+      239 +- **Built from evaluated parts:** each detector is the val-tun
+          +ed component already saved. Detectors are independent per sens
+          +or, so the hybrid is a per-sensor choice and needs no new mode
+          +l.                                                            
+      240 +- **Not evaluated as a combined system:** the temperature comb
+          +ination (chart plus spike rule) was never scored together. The
+          + hybrid was chosen from val results, not from test, and should
+          + be validated on fresh data before release (the §9 gate).     
+      241 +- **Next step:** chart residuals from a context-adjusted expec
+          +ted value instead of raw readings.                            
+      242 +                                                              
+      243  **Serving: real time, on-device.**
+      244  - The detectors run on the assumed home hub (Raspberry Pi / Ho
+           me Assistant class). Readings arrive once a minute, and each d
+           etector updates its state and alerts immediately.
+      245  - **Why on-device:** this is a security and appliance use case
+           . Alerts must work without internet, and raw in-home activity 
+           data stays private.
+
+● Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      25  | Isolation Forest v2 | 8/14 | 4 | 10 | 20.9 MB | 0.027 |
+      26  | Isolation Forest v1 | 2/14 | 4 | 16 | 11.5 MB | 0.023 |
+      27  
+      28 -The rules' perfect score is an **upper bound**. The rules use a
+         - configured schedule that matches how the data was generated (s
+         -ee [§6](#6-models-and-justification)). For a real deployment I 
+         -would investigate a **hybrid**: control charts for fridge and h
+         -eating, rules for door and motion.                             
+      28 +The rules' perfect score is an **upper bound**. The rules use a
+         + configured schedule that matches how the data was generated (s
+         +ee [§6](#6-models-and-justification)). The final selection for 
+         +production is a **hybrid** chosen per sensor (§9): EWMA control
+         + charts for fridge and heating drift, rules for temperature spi
+         +kes, door and motion.                                          
+      29  
+      30  ---
+      31  
+
+● I added the hybrid as the final production selection at the top of §9, as a
+  new block called "What is deployed".
+
+  ┌─────────────┬─────────────────────┬─────────────────────────────────────┐
+  │   Sensor    │  Deployed detector  │                 Why                 │
+  ├─────────────┼─────────────────────┼─────────────────────────────────────┤
+  │ Fridge      │                     │ Faster on val (power loss 4.5 vs 9  │
+  │ power       │ EWMA chart          │ min, compressor stuck on 19 vs 26   │
+  │             │                     │ min), and no schedule needed        │
+  ├─────────────┼─────────────────────┼─────────────────────────────────────┤
+  │             │ EWMA chart on       │ Faster on heating failure (about 21 │
+  │ Temperature │ heating drift, plus │  vs 59 min); charts don't target    │
+  │             │  the spike rule     │ spikes                              │
+  ├─────────────┼─────────────────────┼─────────────────────────────────────┤
+  │ Motion      │ Rules               │ Intrusion depends on the time of    │
+  │             │                     │ day and the door link               │
+  ├─────────────┼─────────────────────┼─────────────────────────────────────┤
+  │ Door        │ Rules               │ Night openings are short and depend │
+  │             │                     │  only on the time of day            │
+  └─────────────┴─────────────────────┴─────────────────────────────────────┘
+
+  The block also states three caveats openly:
+  - Built from parts already evaluated: each detector is the version already
+    tuned on val, and detectors are independent per sensor, so no new model is
+    needed.
+  - Not scored as one system: the temperature combination of chart plus spike
+    rule was never scored together. The hybrid was chosen from val results, not
+    test results, so it should pass the §9 release gate on fresh data before
+    release.
+  - Next step: feed the charts residuals from a context-adjusted expected value
+    instead of raw readings.
+
+  I also updated the Overview line in §1 so it calls the hybrid the final
+  selection for production, pointing to §9. §6 still describes it as the
+  recommendation, with the reasoning.
+
+  Still open: push the frozen-before-test tag, and fill in the 005_*.txt
+  transcript row after your final export.
+
+✻ Cogitated for 24s · done 10:20 PM
+
+※ recap: You're finishing the smart-home anomaly-detection take-home, and the README is complete, with the hybrid now listed as the production choice in §9. Next, review the README, then push the frozen-before-test tag and export the final transcript.
+
+❯ Under #9 temperature row: add the cost: "faster on heating failure, at the    
+  cost of more false alarms". And make #1 and #6 consistent with #9: the hybrid 
+  is the production recommendation, assembled from the evaluated per-sensor     
+  detectors and not scored as one combined system.                              
+
+● Bash(cd "/c/Users/Gracy/Projects/Anomaly Detection" && .venv/Scripts/python -
+      <<'EOF'
+      from pathlib import Path…)
+  ⎿  ok
+     28:The rules' perfect score is an **upper bound**. The rules use a con
+     figured schedule that matches how the data was generated (see [§6](#6-
+     … +21 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+5 -5)
+      25  | Isolation Forest v2 | 8/14 | 4 | 10 | 20.9 MB | 0.027 |
+      26  | Isolation Forest v1 | 2/14 | 4 | 16 | 11.5 MB | 0.023 |
+      27  
+      28 -The rules' perfect score is an **upper bound**. The rules use a
+         - configured schedule that matches how the data was generated (s
+         -ee [§6](#6-models-and-justification)). The final selection for 
+         -production is a **hybrid** chosen per sensor (§9): EWMA control
+         - charts for fridge and heating drift, rules for temperature spi
+         -kes, door and motion.                                          
+      28 +The rules' perfect score is an **upper bound**. The rules use a
+         + configured schedule that matches how the data was generated (s
+         +ee [§6](#6-models-and-justification)). The production recommend
+         +ation is a **hybrid** chosen per sensor (§9): EWMA control char
+         +ts for fridge and heating drift, rules for temperature spikes, 
+         +door and motion. It is assembled from the evaluated per-sensor 
+         +detectors and was not scored as one combined system.           
+      29  
+      30  ---
+      31  
+     ...
+      170  
+      171  **Caveat:** the rules' score depends on a configured schedule 
+           (away Tue–Thu 09–17, night 00–05). That schedule matches the w
+           indows the generator used to inject intrusions and night openi
+           ngs, so **rule recall is an upper bound**. The ML models and c
+           harts get no schedule. A sensitivity run widened only the sche
+           dule (away 08:00–18:30, night 23:30–06:00). Errors rose from 0
+            to 2 on val and from 0 to 1 on test, because people are still
+            home at 08:00 before they leave.
+      172  
+      173 -**Recommendation for a real deployment (not built or tested): 
+          -investigate a hybrid.**                                       
+      173 +**Production recommendation: a hybrid** (details in §9). It is
+          + assembled from the evaluated per-sensor detectors and was not
+          + scored as one combined system.                               
+      174  - **EWMA control charts for fridge power and heating drift.** 
+           They were faster on val (heating failure ~21 vs ~59 min, power
+            loss 4.5 vs 9 min) and need no hand-written schedule.
+      175  - **Rules for door and motion,** where the anomaly depends on 
+           the time of day and charts cannot see it.
+      176  - **A further extension:** chart residuals from a context-adju
+           sted expected value instead of raw readings.
+     ...
+      226  
+      227  ## 9. Productionization
+      228  
+      229 -**What is deployed: the hybrid (final selection for production
+          -).**                                                          
+      230 -The PoC selected the rules on val. Their score is an upper bou
+          -nd, because their schedule matches the generator, so the produ
+          -ction configuration is the hybrid from §6, chosen per sensor: 
+      229 +**Production recommendation: the hybrid.**                    
+      230 +The PoC selected the rules on val. Their score is an upper bou
+          +nd, because their schedule matches the generator, so the produ
+          +ction recommendation is the hybrid from §6, chosen per sensor:
+      231  
+      232  | Sensor | Detector | Why |
+      233  |---|---|---|
+      234  | Fridge power | EWMA control chart (power and run length per 
+           mode) | Faster on val (power loss 4.5 vs 9 min, stuck-on 19 vs
+            26 min); no schedule needed |
+      235 -| Temperature | EWMA chart on `temp_dev` for heating drift + t
+          -he spike rule (\|`temp_resid`\| > 1.5 °C) | Chart is faster on
+          - heating failure (~21 vs ~59 min on val); charts do not target
+          - spikes |                                                     
+      235 +| Temperature | EWMA chart on `temp_dev` for heating drift + t
+          +he spike rule (\|`temp_resid`\| > 1.5 °C) | Faster on heating 
+          +failure (~21 vs ~59 min on val), at the cost of more false ala
+          +rms (val 1 vs 0, test 3 vs 0 for rules on temperature); charts
+          + do not target spikes |                                       
+      236  | Motion | Rules (intrusion: away hours + no door opening) | T
+           he anomaly depends on time of day and the door link; charts ca
+           nnot see it |
+      237  | Door | Rules (night opening, left open > 10 min) | Same: nig
+           ht openings are short and purely time-of-day |
+      238  
+
+● I made both changes; §1, §6 and §9 now describe the hybrid the same way.
+
+  - §9 temperature row: it now reads "Faster on heating failure (~21 vs ~59 min
+    on val), at the cost of more false alarms". I added the actual counts on
+    temperature, charts against rules: 1 vs 0 on val and 3 vs 0 on test.
+  - Consistent wording: §1 Overview and the §6 heading now say the hybrid is the
+    production recommendation. Both add that it is assembled from the evaluated
+    per-sensor detectors and was not scored as one combined system. The §9
+    heading and intro use the same "production recommendation" wording; before,
+    they called it the "final selection" and "what is deployed".
+
+  Still open: push the frozen-before-test tag, and fill in the 005_*.txt
+  transcript row after your final export.
+
+✻ Churned for 14s · done 10:27 PM
+
+※ recap: The take-home anomaly-detection PoC is complete, and the README now calls the hybrid the production recommendation consistently in sections 1, 6 and 9. Next, push the frozen-before-test tag and fill in the final transcript row after you export.
